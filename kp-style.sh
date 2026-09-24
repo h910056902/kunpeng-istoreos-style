@@ -20,11 +20,6 @@ KP_INDEX_CACHE="/tmp/luci-indexcache-bootstrap"
 KP_BACKUP_BASE="/mnt/storage/data/kp-style-backup"
 KP_WORK="/tmp/kp-style-work"
 
-ARGON_IPK_URLS="
-https://mt3000.netlify.app/theme/luci-theme-argon-master_2.2.9.4_all.ipk
-https://raw.githubusercontent.com/guoguobuku/mt6000-istoreos/master/theme/luci-theme-argon-master_2.2.9.4_all.ipk
-"
-
 # ---- 终端输出（中文占 2 列，禁右边框/右对齐；非 tty 自动去色）----
 if [ -t 1 ]; then
     C_G="\033[32m"; C_R="\033[31m"; C_Y="\033[33m"; C_B="\033[36m"; C_N="\033[0m"
@@ -53,10 +48,26 @@ clear_luci_cache() {
     ui_ok "LuCI 缓存已清理（$KP_INDEX_CACHE / luci-modulecache）"
 }
 
-# 页面健康检查：403=登录页正常（模板没崩），200/302 也算活，500=模板/脚本崩了
+# 8080 实例只绑在 LAN IP 上（不是 127.0.0.1），探 127.0.0.1 会得到 000 假阴性
+kp_lan_ip() {
+    ip=$(uci -q get uhttpd.openwrt8080.listen_http 2>/dev/null | awk -F: '{print $1}')
+    case "$ip" in
+        ""|\$*|0.0.0.0|\[::\]) ip=$(uci -q get network.lan.ipaddr 2>/dev/null) ;;
+    esac
+    case "$ip" in
+        ""|\$*|0.0.0.0|\[::\]) ip=$(ip -4 addr show br-lan 2>/dev/null | grep -m1 -oE 'inet [0-9.]+' | awk '{print $2}') ;;
+    esac
+    printf '%s' "$ip"
+}
+
+# 页面健康检查：403=登录页正常（模板没崩），200/302 也算活，500=模板/脚本崩了，000=探不到
 probe_8080() {
-    code=$(curl -s -o /dev/null -w '%{http_code}' -m 8 "http://127.0.0.1:8080/cgi-bin/luci/admin/status/details" 2>/dev/null)
-    [ -n "$code" ] || code=$(wget -qS -O /dev/null "http://127.0.0.1:8080/cgi-bin/luci/admin/status/details" 2>&1 | awk '/HTTP\//{print $2; exit}')
+    ip=$(kp_lan_ip)
+    [ -n "$ip" ] || { printf '000'; return; }
+    url="http://$ip:8080/cgi-bin/luci/admin/status/details"
+    code=$(curl -s -o /dev/null -w '%{http_code}' -m 8 "$url" 2>/dev/null)
+    [ -n "$code" ] || code=$(wget -qS -O /dev/null "$url" 2>&1 | awk '/HTTP\//{print $2; exit}')
+    [ -n "$code" ] || code=000
     printf '%s' "$code"
 }
 
@@ -75,7 +86,12 @@ do_selftest() {
     df -h "$KP_ROOT" 2>/dev/null | tail -n +1
     free -k | head -2
     ui_do "8080 页面探活（预期 403=登录页正常 / 200=已登录）"
-    code=$(probe_8080); [ "$code" = "500" ] && ui_no "HTTP $code —— 设备总览模板可能已损坏，先回滚再操作" || ui_ok "HTTP $code"
+    code=$(probe_8080)
+    case "$code" in
+        500) ui_no "HTTP 500 —— 设备总览模板可能已损坏，先回滚再操作" ;;
+        000) ui_warn "HTTP 000 —— 无法确定 8080 监听地址或服务未启动（检查 uhttpd.openwrt8080）" ;;
+        *)   ui_ok "HTTP $code" ;;
+    esac
     ui_do "已有备份清单"
     ls -1 "$KP_BACKUP_BASE" 2>/dev/null || ui_warn "尚无备份目录"
 }
@@ -106,74 +122,55 @@ latest_backup() {
 }
 
 # ============================================================================
-# 3) 升级 Argon 主题 2.2.9.4（换芯不换名：只换 bootstrap 目录内容，不改包装器）
+# 3) Argon 配置层升级（主色 / 暗色 / 模糊度 / 登录背景）
+#
+# ⚠ 本步骤刻意【不替换主题模板】。设备实测结论：
+#   - 本实例的 LuCI 资源目录中没有 luci.js（全盘 find 无命中）；
+#   - Argon 2.2.9.4 的 footer 依赖 `L.require('menu-argon')`，L 由 luci.js 提供；
+#   - 强行把 1.8.4 主题换成 2.2.9.4 → 侧栏导航因 L 未定义而整体失效
+#     （页面仍返回 200，探活查不出来，比现状更糟）。
+#   因此采用「配置层升级」：主题模板不动，只升级 /etc/config/argon。
+#   详见 docs/DESIGN.md 第五节。
 # ============================================================================
+ARGON_IPK_URLS="
+https://mt3000.netlify.app/theme/luci-theme-argon-master_2.2.9.4_all.ipk
+https://raw.githubusercontent.com/guoguobuku/mt6000-istoreos/master/theme/luci-theme-argon-master_2.2.9.4_all.ipk
+"
+
 do_argon_upgrade() {
-    ui_sec "Argon 主题升级 1.8.4 -> 2.2.9.4（换芯不换名）"
+    ui_sec "Argon 配置升级（配置层）"
     [ -d "$KP_THEME_STATIC" ] || die "未找到私有主题目录 $KP_THEME_STATIC"
 
-    mkdir -p "$KP_WORK" || die "无法创建工作目录"
-    ipk="$KP_WORK/argon-2.2.9.4.ipk"
-    if [ ! -s "$ipk" ]; then
-        ok=0
-        for u in $ARGON_IPK_URLS; do
-            ui_do "下载: $u"
-            if kp_fetch "$u" "$ipk" && [ -s "$ipk" ]; then ok=1; break; fi
-        done
-        [ "$ok" = "1" ] || die "Argon ipk 全部下载源失败"
-    fi
-    ui_ok "ipk 就绪: $(wc -c < "$ipk") 字节"
-
-    # 老式 ipk = tar.gz{control.tar.gz, data.tar.gz, debian-binary}
-    rm -rf "$KP_WORK/x" "$KP_WORK/data"; mkdir -p "$KP_WORK/x" "$KP_WORK/data"
-    tar -xzf "$ipk" -C "$KP_WORK/x" || die "ipk 外层解包失败（非 tar.gz 嵌套格式？）"
-    tar -xzf "$KP_WORK/x/data.tar.gz" -C "$KP_WORK/data" || die "data.tar.gz 解包失败"
-
-    src_static="$KP_WORK/data/www/luci-static/argon"
-    src_view="$KP_WORK/data/usr/lib/lua/luci/view/themes/argon"
-    [ -d "$src_static" ] || die "ipk 内无 $src_static，包结构不符"
-    [ -d "$src_view" ] || die "ipk 内无 $src_view，包结构不符"
-
-    # 落盘前先在 /tmp 完整组装，避免半成品覆盖线上目录
-    stage="$KP_WORK/stage"; rm -rf "$stage"; mkdir -p "$stage/bootstrap"
-    cp -a "$src_static/." "$stage/bootstrap/" || die "静态资源组装失败"
-    mkdir -p "$KP_WORK/stage_view/bootstrap"
-    cp -a "$src_view/." "$KP_WORK/stage_view/bootstrap/" || die "视图模板组装失败"
-
     # 预烘焙 Argon 配置（不装 luci-app-argon-config，避免污染 80 端口菜单）
-    if [ ! -f /etc/config/argon ]; then
-        cat > /tmp/argon_uci <<'EOF_ARGON'
-config argon 'global'
+    # ⚠ 段类型必须是 `global`（= config global 'global'）。
+    #   Argon 主题模板读的是 uci:get_first('argon', 'global', 'primary')，第二参数是【段类型】；
+    #   若写成 `config argon 'global'`（段类型=argon），取值为 nil →
+    #   渲染出 `--primary: ;` 空值，全站配色失效（本仓库踩过并已修复的坑）。
+    cat > /tmp/argon_uci <<'EOF_ARGON'
+config global 'global'
 	option primary '#5e72e4'
 	option dark_primary '#483d8b'
 	option mode 'dark'
 	option blur '4'
+	option blur_dark '6'
 	option transparency '0.5'
+	option transparency_dark '0.45'
 EOF_ARGON
-        # 语法自检：uci 无法校验临时文件，仅格式人工锚定；先备份再落盘
-        mv /tmp/argon_uci /etc/config/argon
-        ui_ok "预烘焙 /etc/config/argon（暗色 / 主色 #5e72e4 / 模糊 4）"
-    else
-        ui_warn "/etc/config/argon 已存在，跳过预烘焙"
+    if [ -f /etc/config/argon ]; then
+        cp /etc/config/argon "/etc/config/argon.kpbak-$(now_tag)"
+        ui_warn "/etc/config/argon 已存在，已备份后覆盖"
     fi
-
-    # 原子替换：旧目录改名 -> 新目录就位 -> 确认存在 -> 删旧
-    ts=$(now_tag)
-    mv "$KP_THEME_STATIC" "$KP_THEME_STATIC.bak-$ts" || die "旧静态目录改名失败"
-    mv "$stage/bootstrap" "$KP_THEME_STATIC" || { mv "$KP_THEME_STATIC.bak-$ts" "$KP_THEME_STATIC"; die "新静态目录就位失败（已回滚）"; }
-    mv "$KP_THEME_VIEW" "$KP_THEME_VIEW.bak-$ts" || die "旧视图目录改名失败"
-    mkdir -p "$KP_VIEW/themes"
-    mv "$KP_WORK/stage_view/bootstrap" "$KP_THEME_VIEW" || { mv "$KP_THEME_VIEW.bak-$ts" "$KP_THEME_VIEW"; die "新视图就位失败（已回滚）"; }
+    mv /tmp/argon_uci /etc/config/argon
+    # 读回断言：段类型必须是 global，且 primary 非空
+    if [ "$(uci -q get argon.global.primary)" = "#5e72e4" ]; then
+        ui_ok "argon 配置就位（段类型 global，暗色 + 主色 #5e72e4 + 模糊 4）"
+    else
+        die "argon 配置读回断言失败（段类型应为 global），已中止"
+    fi
 
     clear_luci_cache
-    # 读回验证
-    if [ -f "$KP_THEME_STATIC/css/cascade.css" ] || [ -f "$KP_THEME_STATIC/css/argon.css" ]; then
-        ui_ok "新主题静态资源已就位: $(ls "$KP_THEME_STATIC" | tr '\n' ' ')"
-    else
-        ui_no "新主题静态资源异常，请检查 $KP_THEME_STATIC"
-    fi
     code=$(probe_8080)
-    [ "$code" = "500" ] && ui_no "HTTP 500 —— 新主题模板与 LuCI 不兼容，执行回滚: 选项 6" || ui_ok "升级后探活 HTTP $code（403/200 均为正常）"
+    [ "$code" = "500" ] && ui_no "HTTP 500 —— 主题模板可能已损坏，执行回滚: 选项 6" || ui_ok "配置升级后探活 HTTP $code（403/200 均为正常）"
     ui_warn "浏览器请 Ctrl+F5 强刷以绕过旧 CSS 缓存"
 }
 
@@ -201,55 +198,49 @@ do_overview() {
 }
 
 # ============================================================================
-# 5) 注册入口：鲲鹏商店 / 1Panel / Docker（CGI 包装器锚点补丁 + 承载页）
+# 5) 注册入口：鲲鹏商店 / 1Panel / Docker（向 CGI 包装器注入「服务」菜单）
 # ============================================================================
 do_register() {
     ui_sec "注册入口（鲲鹏商店 / 1Panel / Docker）"
     pdir="$(cd "$(dirname "$0")" 2>/dev/null && pwd)/payload"
     [ -f "$KP_CGI" ] || die "找不到 CGI 包装器 $KP_CGI"
+    [ -f "$pdir/kp_services.lua" ] || die "缺少 $pdir/kp_services.lua"
 
-    if grep -q 'KP_REGISTER_MARKER' "$KP_CGI"; then
-        ui_warn "入口补丁已存在（KP_REGISTER_MARKER），跳过重复注入"
+    if grep -q 'KP-SERVICES-MARKER' "$KP_CGI"; then
+        ui_warn "服务菜单补丁已存在（KP-SERVICES-MARKER），跳过重复注入"
     else
+        # 锚点断言：设备文件与预期不符即拒绝注入
+        if ! grep -q 'luci.dispatcher.indexcache = "/tmp/luci-indexcache-bootstrap"' "$KP_CGI"; then
+            die "CGI 包装器锚点不存在，设备文件与预期不符，停止注入"
+        fi
         ts=$(now_tag)
         cp "$KP_CGI" "$KP_CGI.bak-$ts" || die "CGI 备份失败"
-        [ -f "$pdir/kp_register.lua" ] || die "缺少 $pdir/kp_register.lua（侦察后生成）"
-        # 补丁体必须以锚点断言方式插入：锚点不存在 = 设备文件与预期不符 = 拒绝注入
-        if grep -q 'luci.sgi.cgi.run()' "$KP_CGI"; then
-            cat "$pdir/kp_register.lua" > /tmp/kp_register_body.lua
-            # lua 语法校验（拼装校验：包装器主体 + 补丁体）
-            sed 's/^luci\.sgi\.cgi\.run()$/--KP_SPLICE\nluci.sgi.cgi.run()/' "$KP_CGI" > /tmp/kp_cgi_test
-            sed -i '/--KP_SPLICE/r /tmp/kp_register_body.lua' /tmp/kp_cgi_test 2>/dev/null || true
-            if lua -e "assert(loadfile('/tmp/kp_cgi_test'))" 2>/dev/null; then
-                cp "$KP_CGI" "$KP_CGI.bak-$ts"
-                # 在 luci.sgi.cgi.run() 前插入补丁体
-                awk 'BEGIN{done=0}
-                    !done && /^luci\.sgi\.cgi\.run\(\)$/ { while ((getline line < "'"$pdir"'/kp_register.lua") > 0) print line; done=1 }
-                    { print }' "$KP_CGI" > /tmp/kp_cgi_new \
-                  && lua -e "assert(loadfile('/tmp/kp_cgi_new'))" \
-                  && cp /tmp/kp_cgi_new "$KP_CGI" \
-                  || { cp "$KP_CGI.bak-$ts" "$KP_CGI"; die "补丁注入失败，已回滚 CGI"; }
-                ui_ok "CGI 包装器补丁已注入（KP_REGISTER_MARKER）"
-            else
-                die "拼接后 lua 语法校验未通过，拒绝落盘"
-            fi
+        # 在锚点行之前插入补丁体
+        awk -v body="$pdir/kp_services.lua" '
+            !done && /^luci\.dispatcher\.indexcache = "\/tmp\/luci-indexcache-bootstrap"$/ {
+                while ((getline line < body) > 0) print line
+                done=1
+            }
+            { print }' "$KP_CGI" > /tmp/kp_cgi_new || die "补丁拼接失败"
+        # 落盘前 lua 语法校验（不通过绝不替换）
+        if lua -e "assert(loadfile('/tmp/kp_cgi_new'))" 2>/dev/null; then
+            cp /tmp/kp_cgi_new "$KP_CGI" && chmod 755 "$KP_CGI" || {
+                cp "$KP_CGI.bak-$ts" "$KP_CGI"; die "补丁落盘失败，已回滚"; }
+            ui_ok "CGI 包装器已注入「服务」菜单（KP-SERVICES-MARKER）"
         else
-            die "CGI 包装器锚点（luci.sgi.cgi.run()）不存在，设备文件与预期不符，停止注入"
+            cp "$KP_CGI.bak-$ts" "$KP_CGI"
+            die "拼接后 lua 语法校验未通过，已回滚，拒绝落盘"
         fi
     fi
 
-    # 私有承载页模板（iframe + 直链兜底）
-    for h in kp_store kp_1panel kp_docker; do
-        if [ -f "$pdir/admin_status/$h.htm" ]; then
-            cp "$pdir/admin_status/$h.htm" "$KP_VIEW/admin_status/$h.htm" || ui_no "承载页 $h.htm 落盘失败"
-            ui_ok "承载页: admin_status/$h.htm"
-        else
-            ui_warn "缺少 $pdir/admin_status/$h.htm，跳过该入口"
-        fi
-    done
     clear_luci_cache
     code=$(probe_8080)
-    [ "$code" = "500" ] && ui_no "HTTP 500 —— 补丁异常，请回滚 CGI: ls $KP_CGI.bak-*" || ui_ok "注册后探活 HTTP $code"
+    if [ "$code" = "500" ]; then
+        ui_no "HTTP 500 —— 补丁异常，请回滚 CGI: ls $KP_CGI.bak-*"
+    else
+        ui_ok "注册后探活 HTTP $code（403=登录页/200=正常）"
+        ui_ok "入口位于侧栏「服务」菜单：鲲鹏商店 / 1Panel 面板 / Docker 容器"
+    fi
 }
 
 # ============================================================================
@@ -292,7 +283,7 @@ while true; do
     printf "\n%s\n" "====== kp-style · 鲲鹏 8080 LuCI iStoreOS 风格化 ======"
     printf " 1) 体检与基线（只读）\n"
     printf " 2) 备份 8080 实例\n"
-    printf " 3) Argon 主题升级 2.2.9.4\n"
+    printf " 3) Argon 配置升级（主色/暗色/模糊）\n"
     printf " 4) 设备总览卡片化部署（需 payload）\n"
     printf " 5) 注册入口: 鲲鹏商店 / 1Panel / Docker（需 payload）\n"
     printf " 6) 回滚最近备份\n"

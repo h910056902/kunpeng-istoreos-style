@@ -56,3 +56,37 @@
 - ipk 为老式 gzip+tar 嵌套三件套，busybox `tar xzf` 可直接解开，无需 opkg；
 - 资源 URL：Argon 视图用 `<%=media%>` 引用静态目录，media 由 mediaurlbase 推导，
   包装器强制为 `/luci-static/bootstrap` → 视图模板原样可用，无需改路径。
+
+## 五、主题模板升级评估（结论：**不换模板，只升配置**）
+
+Argon 2.2.9.4 ipk 已实际下载解包核对（471 KB，35 个静态文件 + 7 个视图 + `menu-argon.js`）：
+
+| 检查项 | 结果 |
+|---|---|
+| 配置键兼容 | ✅ 2.2.9.4 的 header 读 `get_first('argon','global',...)`，与本仓库预烘焙配置**完全一致** |
+| 资源路径 | ✅ 全部走 `<%=media%>`，由包装器统一解析到 `/luci-static/bootstrap` |
+| 硬编码路径 | ⚠️ 仅 1 处：`fs.readfile('/www/luci-static/argon/css/dark.css')`（可改） |
+| **菜单渲染** | ❌ **阻塞项** |
+
+阻塞项详解：2.2.9.4 的 `footer.htm` 以 `L.require('menu-argon')` 在**运行时**构建侧栏，
+`L` 由 LuCI 的 `luci.js` 提供；但本实例全盘无 `luci.js`
+（`find / -name luci.js` 零命中），而现行 1.8.4 模板是**服务端渲染菜单**、不依赖它。
+强行替换 → 菜单整体不渲染，且页面仍返回 200（探活无法发现）。
+
+**决策**：主题模板保持 1.8.4 不动，只升级 `/etc/config/argon`（配置层）。
+理由与完整证据链见 [TROUBLESHOOTING.md](TROUBLESHOOTING.md) 决策 A。
+
+**若将来要上 2.2.9.4**：前置条件是补齐 `luci.js` 运行时并验证 `menu-argon` 可加载，
+属于独立改造，必须带完整备份/回滚预案，且验收不能只看 HTTP 码——
+需在浏览器确认侧栏菜单真的渲染出来。
+
+## 六、本实例的主题配置读取点（1.8.4 实测）
+
+| 模板 | 读取方式 |
+|---|---|
+| `themes/bootstrap/header.htm` | `uci:get_first('argon','global',{primary,dark_primary,blur,blur_dark,transparency,transparency_dark,mode})` |
+| `themes/bootstrap/header_login.htm` | 同上（登录页） |
+| dark.css | 1.8.4 读实例私有 `.../www/luci-static/bootstrap/css/dark.css`；`mode=dark` 时**内联**进页面 |
+
+> 段类型必须是 `global`，否则取值恒为 nil → 全站配色失效。详见 TROUBLESHOOTING 坑 1。
+

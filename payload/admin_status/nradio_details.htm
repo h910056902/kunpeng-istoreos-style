@@ -1,0 +1,695 @@
+<%# NRadio device overview 20260925-1 for the isolated LuCI instance on port 8080. -%>
+<%
+	local fs = require "nixio.fs"
+	local sys = require "luci.sys"
+	local util = require "luci.util"
+	local stat = require "luci.tools.status"
+	local http = require "luci.http"
+
+	local function trim(value)
+		local cleaned = tostring(value or ""):gsub("^%s+", ""):gsub("%s+$", "")
+		return cleaned
+	end
+
+	local function first_line(value)
+		return trim((value or ""):match("([^\r\n]+)") or "")
+	end
+
+	local function read(path)
+		return fs.readfile(path) or ""
+	end
+
+	local function command(value)
+		return trim(sys.exec(value .. " 2>/dev/null") or "")
+	end
+
+	local function safe_call(callable, ...)
+		if type(callable) ~= "function" then
+			return nil
+		end
+		local ok, result = pcall(callable, ...)
+		return ok and result or nil
+	end
+
+	local function safe_table(value)
+		return type(value) == "table" and value or {}
+	end
+
+	local function has_route(...)
+		local node = luci.dispatcher.context.tree
+		for _, name in ipairs({ ... }) do
+			node = type(node) == "table" and node.nodes and node.nodes[name]
+			if type(node) ~= "table" then return false end
+		end
+		return node.target ~= nil and not node.hidden
+	end
+
+	local function normalize_nradio_model(raw_model, raw_board, raw_compatible)
+		local combined = string.upper(table.concat({
+			tostring(raw_model or ""),
+			tostring(raw_board or ""),
+			tostring(raw_compatible or "")
+		}, " "))
+		if combined:find("HC%-WT9108") then
+			return "NRadio_C8-668"
+		elseif combined:find("HC%-WT9104") then
+			return "NRadio_C8-688"
+		elseif combined:find("HC%-WT9302") or combined:find("HCMT7987%-NAND") then
+			return "NRadio_C8-788"
+		elseif combined:find("HC%-WT9120") then
+			return "NRadio_C5800-650"
+		elseif combined:find("HC%-WT9126") then
+			return "NRadio_C5800-688"
+		elseif combined:find("HC%-WT9111") or combined:find("NRADIO%-WT9111") then
+			return "NRadio_NBCPE"
+		elseif combined:find("HC%-WT9500") then
+			return "NRadio_C2000Ultra"
+		elseif combined:find("HC%-WT9303") then
+			return "NRadio_C2000MAX"
+		elseif combined:find("UDX710") or combined:find("RG200U%-CN") then
+			return "NRadio_C2000Pro"
+		end
+		return "未知机型"
+	end
+
+	local function mib(kib)
+		return string.format("%.1f MiB", (tonumber(kib) or 0) / 1024)
+	end
+
+	local function bytes(value)
+		local number = tonumber(value) or 0
+		if number >= 1073741824 then
+			return string.format("%.2f GiB", number / 1073741824)
+		elseif number >= 1048576 then
+			return string.format("%.2f MiB", number / 1048576)
+		elseif number >= 1024 then
+			return string.format("%.2f KiB", number / 1024)
+		end
+		return string.format("%d B", number)
+	end
+
+	local function duration(value)
+		local seconds = math.floor(tonumber(value) or 0)
+		local days = math.floor(seconds / 86400)
+		local hours = math.floor((seconds % 86400) / 3600)
+		local minutes = math.floor((seconds % 3600) / 60)
+		return string.format("%d 天 %02d:%02d:%02d", days, hours, minutes, seconds % 60)
+	end
+
+	local function metric(value, unit)
+		local number = tonumber(value)
+		if not number then return "-" end
+		return tostring(number) .. (unit or "")
+	end
+
+	local function band_text(mode, band)
+		local value = trim(band)
+		if value == "" or value == "-" then return "-" end
+		if value:match("^[NBnb]") then return value:upper() end
+		local kind = trim(mode):upper()
+		local prefix = ""
+		if kind:find("NR", 1, true) or kind:find("5G", 1, true) or kind == "SA" or kind == "NSA" then
+			prefix = "N"
+		elseif kind:find("LTE", 1, true) or kind:find("4G", 1, true) then
+			prefix = "B"
+		end
+		return prefix .. value
+	end
+
+	local function collect_live_status()
+		local info = safe_table(safe_call(util.ubus, "system", "info"))
+		local runtime = safe_table(safe_call(util.ubus, "infocd", "runtime"))
+		local global = safe_table(runtime.global)
+		local memory = {}
+		for key, value in read("/proc/meminfo"):gmatch("([%w_]+):%s+(%d+)%s+kB") do
+			memory[key] = tonumber(value)
+		end
+		local total = memory.MemTotal
+		local available = memory.MemAvailable
+		if not available and memory.MemFree then
+			available = memory.MemFree + (memory.Buffers or 0) + (memory.Cached or 0)
+		end
+		if total and available then available = math.max(0, math.min(total, available)) end
+		local used = total and available and total - available
+		local percent = total and total > 0 and used and used * 100 / total
+		local swap_total, swap_free = memory.SwapTotal, memory.SwapFree
+		local swap = "-"
+		if swap_total == 0 then
+			swap = "未启用"
+		elseif swap_total and swap_free then
+			swap = "已用 " .. mib(math.max(0, swap_total - swap_free)) .. " / " .. mib(swap_total)
+		end
+		local temperature = tonumber(trim(read("/sys/class/thermal/thermal_zone0/temp")))
+		if temperature and math.abs(temperature) >= 1000 then temperature = temperature / 1000 end
+		local load = safe_table(info.load)
+		local fields = {
+			cpu_usage = metric(global.cpu_percent, "%"),
+			cpu_temperature = temperature and string.format("%.1f °C", temperature) or "-",
+			current_time = os.date("%Y-%m-%d %H:%M:%S"),
+			uptime = info.uptime and duration(info.uptime) or "-",
+			load = load[1] and string.format("%.2f / %.2f / %.2f", (tonumber(load[1]) or 0) / 65536, (tonumber(load[2]) or 0) / 65536, (tonumber(load[3]) or 0) / 65536) or "-",
+			memory_usage = percent and string.format("%.0f%%", percent) or "-",
+			memory_total = total and mib(total) or "-",
+			memory_available = (available and mib(available) or "-") .. " / " .. (memory.MemFree and mib(memory.MemFree) or "-"),
+			memory_cache = (memory.Cached and mib(memory.Cached) or "-") .. " / " .. (memory.Buffers and mib(memory.Buffers) or "-"),
+			swap = swap
+		}
+		local addresses = {}
+		for _, wan in ipairs(safe_table(runtime.wans)) do
+			if type(wan) == "table" then
+				local first = safe_table(safe_table(wan.ipaddrs)[1])
+				addresses[tostring(wan.name or "")] = first.ipaddr
+			end
+		end
+		local by_name = {}
+		for _, item in ipairs(safe_table(runtime.cpe)) do
+			if type(item) == "table" and (item.name == "cpe" or item.name == "cpe1") then
+				local state = tonumber(item.status)
+				by_name[item.name] = {
+					name = item.name,
+					label = item.name == "cpe" and "主线路" or "副线路",
+					connection = state == 0 and "已连接" or (state and "未连接" or "状态未知"),
+					up = state == 0,
+					mode = trim(item.mode),
+					band = band_text(item.mode, item.band),
+					rsrp = metric(item.rsrp, " dBm"),
+					rsrq = metric(item.rsrq, " dB"),
+					sinr = metric(item.sinr, " dB"),
+					temperature = metric(item.model_temp, " °C"),
+					operator = trim(item.sim_company) ~= "" and trim(item.sim_company) or trim(item.isp_company),
+					sim_name = trim(item.sim_name),
+					ipaddr = addresses[item.name] or "-",
+					default_route = tonumber(item.gateway_if) == 1,
+					pci = trim(item.pci),
+					earfcn = trim(item.earfcn)
+				}
+			end
+		end
+		local lines = {}
+		for _, name in ipairs({ "cpe", "cpe1" }) do
+			if by_name[name] then lines[#lines + 1] = by_name[name] end
+		end
+		return {
+			ok = true, version = "20260925-1", fields = fields, lines = lines,
+			cellular_available = type(runtime.cpe) == "table"
+		}
+	end
+
+	local live = collect_live_status()
+	if http.formvalue("refresh") == "1" then
+		http.header("Cache-Control", "no-store")
+		http.write_json(live)
+		return
+	end
+	local initial_json = util.serialize_json(live):gsub("<", "\\u003c"):gsub("&", "\\u0026"):gsub("\226\128\168", "\\u2028"):gsub("\226\128\169", "\\u2029")
+	local plugin_links = safe_table(luci.dispatcher.context.nradio_8080_links)
+	local network_module = safe_table(safe_call(require, "luci.model.network"))
+	local network = safe_call(network_module.init)
+
+	local function process_state(name)
+		local pids = command("pidof " .. name)
+		if pids ~= "" then
+			return "运行中（PID " .. pids .. "）", true
+		end
+		return "未运行", false
+	end
+
+	local function interface_address(device, family, keyword)
+		local output = command("ip -" .. family .. " addr show dev " .. device)
+		return output:match("%s" .. keyword .. "%s+([^%s]+)") or "-"
+	end
+
+	local function disk(path)
+		if path == "/mnt/rootfs_2nd_data" and not read("/proc/mounts"):find(" /mnt/rootfs_2nd_data ", 1, true) then return "未挂载" end
+		local output = command("df -kP " .. path)
+		local last = ""
+		for line in output:gmatch("[^\r\n]+") do
+			last = line
+		end
+		local _, total, used, available, percent = last:match("^(%S+)%s+(%d+)%s+(%d+)%s+(%d+)%s+(%d+)%%")
+		if not total then
+			return "-"
+		end
+		return string.format("已用 %s / 总计 %s，剩余 %s（%s%%）", mib(used), mib(total), mib(available), percent)
+	end
+
+	local cpuinfo = read("/proc/cpuinfo")
+	local cpu_model = cpuinfo:match("model name%s*:%s*([^\r\n]+)") or cpuinfo:match("Hardware%s*:%s*([^\r\n]+)") or cpuinfo:match("Processor%s*:%s*([^\r\n]+)") or "ARM"
+	local cpu_cores = 0
+	for _ in cpuinfo:gmatch("processor%s*:%s*%d+") do
+		cpu_cores = cpu_cores + 1
+	end
+	local cpu_frequency = tonumber(trim(read("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")))
+	local cpu_summary = string.format("%s，%d 核", cpu_model, cpu_cores)
+	if cpu_frequency then
+		cpu_summary = cpu_summary .. string.format("，%.0f MHz", cpu_frequency / 1000)
+	end
+
+	local board = safe_table(safe_call(util.ubus, "system", "board"))
+	local uname = nixio.uname() or {}
+	local release = read("/etc/openwrt_release")
+	local firmware = release:match("DISTRIB_REVISION='([^']+)") or "-"
+	local raw_model = trim(read("/tmp/sysinfo/model"))
+	local raw_board = trim(read("/tmp/sysinfo/board_name"))
+	local raw_compatible = trim(read("/proc/device-tree/compatible"):gsub("%z", " "))
+	local normalized_model = normalize_nradio_model(raw_model, raw_board, raw_compatible)
+	local model_name = normalized_model:gsub("^NRadio_", "")
+
+	local wan = network and safe_call(network.get_wannet, network) or nil
+	local wan6 = network and safe_call(network.get_wan6net, network) or nil
+	local wan_ip = wan and safe_call(wan.ipaddr, wan) or "-"
+	local wan_ifname = wan and safe_call(wan.ifname, wan) or "-"
+	local wan_gateway = wan and safe_call(wan.gwaddr, wan) or "-"
+	local wan6_ip = wan6 and safe_call(wan6.ip6addr, wan6) or "-"
+	local wan6_gateway = wan6 and safe_call(wan6.gw6addr, wan6) or "-"
+	local wan_dns = safe_table(wan and safe_call(wan.dnsaddrs, wan))
+	local wan6_dns = safe_table(wan6 and safe_call(wan6.dns6addrs, wan6))
+	local default_route = first_line(command("ip route show default"))
+	local default_route6 = first_line(command("ip -6 route show default"))
+
+	local openvpn_state, openvpn_up = process_state("openvpn")
+	local clash_state, clash_up = process_state("clash")
+	local adguard_state, adguard_up = process_state("AdGuardHome")
+	local openvpn_status = read("/var/run/openvpn.custom_config.status")
+	local openvpn_updated = openvpn_status:match("Updated,([^\r\n]+)") or "-"
+	local openvpn_read = openvpn_status:match("TUN/TAP read bytes,(%d+)")
+	local openvpn_write = openvpn_status:match("TUN/TAP write bytes,(%d+)")
+	local tun_routes = command("ip route show dev tun0")
+
+	local wifi_networks = safe_table(safe_call(stat.wifi_networks))
+	local radio_count, ssid_count, station_count = 0, 0, 0
+	for _, radio in ipairs(wifi_networks) do
+		radio_count = radio_count + 1
+		for _, wifi in ipairs(radio.networks or {}) do
+			if not wifi.disabled then
+				ssid_count = ssid_count + 1
+			end
+			for _ in pairs(wifi.assoclist or {}) do
+				station_count = station_count + 1
+			end
+		end
+	end
+
+	local leases4 = safe_table(safe_call(stat.dhcp_leases))
+	local leases6 = safe_table(safe_call(stat.dhcp6_leases))
+-%>
+
+<%+header%>
+
+<style type="text/css">
+	.nradio-overview { min-width: 0; }
+	.nradio-toolbar, .nradio-summary, .nradio-cell-grid, .nradio-links { display: flex; flex-wrap: wrap; align-items: center; }
+	.nradio-toolbar { gap: 12px; margin: 12px 0 18px; }
+	.nradio-toolbar label { margin: 0; }
+	.nradio-note { color: #6a6f75; font-size: 12px; }
+	/* 汇总卡片 */
+	.nradio-summary { align-items: stretch; gap: 12px; margin: 16px 0 20px; }
+	.nradio-summary-item {
+		flex: 1 1 150px; position: relative; padding: 14px 16px 14px 20px;
+		border: 1px solid rgba(94,114,228,.22); border-radius: 12px;
+		background: linear-gradient(135deg, rgba(94,114,228,.14), rgba(130,94,228,.04));
+		box-shadow: 0 4px 14px rgba(50,50,93,.08); transition: transform .15s ease, box-shadow .15s ease;
+	}
+	.nradio-summary-item:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(50,50,93,.14); }
+	.nradio-summary-item::before {
+		content: ""; position: absolute; left: 0; top: 14px; bottom: 14px; width: 4px;
+		border-radius: 4px; background: var(--primary, #5e72e4);
+	}
+	.nradio-summary-item span { display: block; font-size: 12px; color: #6a6f75; letter-spacing: .02em; }
+	.nradio-summary-item strong { display: block; margin-top: 6px; font-size: 20px; line-height: 1.35; overflow-wrap: anywhere; }
+	/* 分区容器 */
+	.nradio-overview fieldset.cbi-section {
+		border: 1px solid rgba(94,114,228,.14); border-radius: 12px;
+		padding: 14px 18px 16px; margin: 0 0 18px;
+		background: rgba(255,255,255,.6); box-shadow: 0 2px 10px rgba(50,50,93,.06);
+	}
+	.nradio-overview fieldset.cbi-section > legend {
+		font-weight: 600; font-size: 14px; letter-spacing: .03em;
+		color: var(--primary, #5e72e4); padding: 0 8px;
+	}
+	/* 明细表 */
+	.nradio-details { width: 100%; table-layout: fixed; }
+	.nradio-details td:first-child { width: 31%; font-weight: 600; vertical-align: top; color: #6a6f75; }
+	.nradio-details td { padding: 7px 10px; overflow-wrap: anywhere; word-break: break-word; border-top: 1px dashed rgba(94,114,228,.15); }
+	.nradio-details tr:first-child td { border-top: 0; }
+	.nradio-state-ok { color: #1e9e4b; font-weight: bold; }
+	.nradio-state-bad { color: #d84848; font-weight: bold; }
+	.nradio-state-muted { color: #6a6f75; }
+	.nradio-routes { white-space: pre-wrap; word-break: break-all; margin: 0; font-size: 12px; }
+	/* 蜂窝卡片 */
+	.nradio-cell-grid { align-items: stretch; gap: 12px; }
+	.nradio-cell-card {
+		flex: 1 1 260px; min-width: 0; border: 1px solid rgba(94,114,228,.18); border-radius: 12px;
+		padding: 14px 16px; background: rgba(255,255,255,.55); box-shadow: 0 2px 10px rgba(50,50,93,.06);
+	}
+	.nradio-cell-card h4 { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px; margin: 0 0 12px; }
+	.nradio-cell-card dl { margin: 0; }
+	.nradio-cell-card dt { float: left; clear: left; width: 85px; font-weight: normal; color: #6a6f75; }
+	.nradio-cell-card dd { margin: 0 0 7px 90px; overflow-wrap: anywhere; word-break: break-word; min-height: 20px; }
+	/* 链接与入口卡片 */
+	.nradio-links { gap: 8px; margin: 8px 0 14px; }
+	.nradio-links a { display: inline-block; padding: 7px 12px; border: 1px solid rgba(94,114,228,.25); border-radius: 8px; overflow-wrap: anywhere; transition: background .15s ease; }
+	.nradio-links a:hover { background: rgba(94,114,228,.1); text-decoration: none; }
+	.kp-service-card { flex: 1 1 200px !important; display: flex !important; flex-direction: column; gap: 4px; padding: 14px 16px !important; border-radius: 12px !important; border: 1px solid rgba(94,114,228,.22) !important; background: linear-gradient(135deg, rgba(94,114,228,.1), rgba(130,94,228,.03)); }
+	.kp-service-card strong { font-size: 15px; color: var(--primary, #5e72e4); }
+	.kp-service-card span { font-size: 12px; color: #6a6f75; }
+	.nradio-links a:focus, .nradio-toolbar button:focus { outline: 2px solid var(--primary, #5e72e4); outline-offset: 2px; }
+	/* 暗色（Argon mode=dark 时 body.dark） */
+	body.dark .nradio-note, body.dark .nradio-summary-item span, body.dark .nradio-details td:first-child, body.dark .nradio-cell-card dt, body.dark .kp-service-card span { color: #9aa0a8; }
+	body.dark .nradio-summary-item { border-color: rgba(255,255,255,.09); background: #2b2b31; box-shadow: none; }
+	body.dark .nradio-summary-item::before { background: var(--dark-primary, #483d8b); }
+	body.dark .nradio-overview fieldset.cbi-section { border-color: rgba(255,255,255,.08); background: rgba(51,51,51,.6); box-shadow: none; }
+	body.dark .nradio-details td { border-top-color: rgba(255,255,255,.08); }
+	body.dark .nradio-cell-card { border-color: rgba(255,255,255,.09); background: #2b2b31; box-shadow: none; }
+	body.dark .nradio-links a { border-color: rgba(255,255,255,.14); }
+	body.dark .nradio-links a:hover { background: rgba(72,61,139,.35); }
+	body.dark .kp-service-card { border-color: rgba(255,255,255,.1) !important; background: #2b2b31; }
+	@media (max-width: 600px) {
+		.nradio-details, .nradio-details tbody, .nradio-details tr, .nradio-details td { display: block; width: auto !important; }
+		.nradio-details tr { padding: 6px 0; border-bottom: 1px solid rgba(94,114,228,.12); }
+		.nradio-details td { padding: 3px 8px; }
+		.nradio-summary-item { flex-basis: 110px; }
+		.nradio-summary-item strong { font-size: 18px; }
+	}
+</style>
+
+<div class="nradio-overview" id="nradio-overview">
+<h2 name="content"><%=pcdata(model_name)%> 设备总览</h2>
+<div class="nradio-toolbar">
+	<button type="button" class="cbi-button cbi-button-apply" id="nradio-refresh">刷新状态</button>
+	<label><input type="checkbox" id="nradio-auto-refresh" checked="checked" /> 自动刷新</label>
+	<span class="nradio-note" id="nradio-refresh-status" role="status" aria-live="polite">系统与蜂窝状态每 10 秒更新</span>
+</div>
+<div class="nradio-summary">
+	<div class="nradio-summary-item"><span>CPU 使用率</span><strong data-nradio-field="cpu_usage"><%=pcdata(live.fields.cpu_usage)%></strong></div>
+	<div class="nradio-summary-item"><span>内存使用率</span><strong data-nradio-field="memory_usage"><%=pcdata(live.fields.memory_usage)%></strong></div>
+	<div class="nradio-summary-item"><span>CPU 温度</span><strong data-nradio-field="cpu_temperature"><%=pcdata(live.fields.cpu_temperature)%></strong></div>
+	<div class="nradio-summary-item"><span>运行时间</span><strong data-nradio-field="uptime"><%=pcdata(live.fields.uptime)%></strong></div>
+</div>
+
+<fieldset class="cbi-section">
+	<legend>蜂窝网络</legend>
+	<p class="nradio-note" id="nradio-cellular-note"><%=live.cellular_available and (#live.lines > 0 and "当前蜂窝线路" or "当前未检测到蜂窝线路") or "暂时无法读取蜂窝状态"%></p>
+	<div class="nradio-cell-grid" id="nradio-cellular-lines">
+		<% for _, line in ipairs(live.lines) do %>
+		<section class="nradio-cell-card">
+			<h4><span><%=pcdata(line.label)%> · <%=pcdata(line.name)%></span><span class="<%=line.up and 'nradio-state-ok' or 'nradio-state-muted'%>"><%=pcdata(line.connection)%></span></h4>
+			<dl>
+			<% for _, pair in ipairs({
+				{"运营商", line.operator}, {"SIM 卡名", line.sim_name}, {"网络制式", line.mode},
+				{"频段", line.band}, {"RSRP", line.rsrp}, {"SINR", line.sinr}, {"RSRQ", line.rsrq},
+				{"模组温度", line.temperature}, {"IPv4", line.ipaddr}, {"PCI", line.pci},
+				{"信道号", line.earfcn}, {"默认出口", line.default_route and "是" or "否"}
+			}) do %>
+				<dt><%=pcdata(pair[1])%></dt><dd><%=pcdata(pair[2] ~= "" and pair[2] or "-")%></dd>
+			<% end %>
+			</dl>
+		</section>
+		<% end %>
+	</div>
+</fieldset>
+
+<fieldset class="cbi-section">
+	<legend>系统与硬件</legend>
+	<table class="nradio-details" width="100%" cellspacing="0">
+		<tr><td>设备</td><td><%=pcdata(board.model or board.system or "-")%></td></tr>
+		<tr><td>板型</td><td><%=pcdata(raw_board ~= "" and raw_board or "-")%></td></tr>
+		<tr><td>固件 / 内核</td><td><%=pcdata(firmware)%> / Linux <%=pcdata(uname.release or "-")%></td></tr>
+		<tr><td>CPU</td><td><%=pcdata(cpu_summary)%></td></tr>
+		<tr><td>CPU 温度</td><td><span data-nradio-field="cpu_temperature"><%=pcdata(live.fields.cpu_temperature)%></span></td></tr>
+		<tr><td>当前时间</td><td><span data-nradio-field="current_time"><%=pcdata(live.fields.current_time)%></span></td></tr>
+		<tr><td>运行时间</td><td><span data-nradio-field="uptime"><%=pcdata(live.fields.uptime)%></span></td></tr>
+		<tr><td>系统负载</td><td><span data-nradio-field="load"><%=pcdata(live.fields.load)%></span></td></tr>
+	</table>
+</fieldset>
+
+<fieldset class="cbi-section">
+	<legend>内存与存储</legend>
+	<table class="nradio-details" width="100%" cellspacing="0">
+		<tr><td>内存总量</td><td><span data-nradio-field="memory_total"><%=pcdata(live.fields.memory_total)%></span></td></tr>
+		<tr><td>可用 / 空闲</td><td><span data-nradio-field="memory_available"><%=pcdata(live.fields.memory_available)%></span></td></tr>
+		<tr><td>缓存 / 缓冲</td><td><span data-nradio-field="memory_cache"><%=pcdata(live.fields.memory_cache)%></span></td></tr>
+		<tr><td>Swap 虚拟内存</td><td><span data-nradio-field="swap"><%=pcdata(live.fields.swap)%></span></td></tr>
+		<tr><td>系统 overlay</td><td><%=pcdata(disk("/overlay"))%></td></tr>
+		<tr><td>eMMC 数据盘</td><td><%=pcdata(disk("/mnt/rootfs_2nd_data"))%></td></tr>
+	</table>
+</fieldset>
+
+<fieldset class="cbi-section">
+	<legend>网络与路由</legend>
+	<table class="nradio-details" width="100%" cellspacing="0">
+		<tr><td>WAN IPv4</td><td><%=pcdata(wan_ip or "-")%>（<%=pcdata(wan_ifname or "-")%>，网关 <%=pcdata(wan_gateway or "-")%>）</td></tr>
+		<tr><td>WAN IPv6</td><td><%=pcdata(wan6_ip or "-")%>（网关 <%=pcdata(wan6_gateway or "-")%>）</td></tr>
+		<tr><td>WAN DNS</td><td><%=pcdata(#wan_dns > 0 and table.concat(wan_dns, ", ") or "-")%></td></tr>
+		<tr><td>IPv6 DNS</td><td><%=pcdata(#wan6_dns > 0 and table.concat(wan6_dns, ", ") or "-")%></td></tr>
+		<tr><td>LAN</td><td><%=pcdata(interface_address("br-lan", "4", "inet"))%></td></tr>
+		<tr><td>默认 IPv4 路由</td><td><%=pcdata(default_route ~= "" and default_route or "-")%></td></tr>
+		<tr><td>默认 IPv6 路由</td><td><%=pcdata(default_route6 ~= "" and default_route6 or "-")%></td></tr>
+		<tr><td>无线 / 在线终端</td><td><%=radio_count%> 个射频，<%=ssid_count%> 个启用网络，<%=station_count%> 个无线终端</td></tr>
+		<tr><td>DHCP 租约</td><td>IPv4：<%=#leases4%>，IPv6：<%=#leases6%></td></tr>
+	</table>
+</fieldset>
+
+<fieldset class="cbi-section">
+	<legend>VPN 与核心服务</legend>
+	<table class="nradio-details" width="100%" cellspacing="0">
+		<tr><td>OpenVPN</td><td class="<%=openvpn_up and 'nradio-state-ok' or 'nradio-state-bad'%>"><%=pcdata(openvpn_state)%></td></tr>
+		<tr><td>tun0</td><td><%=pcdata(interface_address("tun0", "4", "inet"))%>，统计更新时间 <%=pcdata(openvpn_updated)%></td></tr>
+		<tr><td>OpenVPN 流量</td><td>读取 <%=pcdata(bytes(openvpn_read))%> / 写入 <%=pcdata(bytes(openvpn_write))%></td></tr>
+		<tr><td>OpenVPN 路由</td><td><pre class="nradio-routes"><%=pcdata(tun_routes ~= "" and tun_routes or "-")%></pre></td></tr>
+		<tr><td>OpenClash</td><td class="<%=clash_up and 'nradio-state-ok' or 'nradio-state-bad'%>"><%=pcdata(clash_state)%>，utun <%=pcdata(interface_address("utun", "4", "inet"))%></td></tr>
+		<tr><td>AdGuardHome</td><td class="<%=adguard_up and 'nradio-state-ok' or 'nradio-state-bad'%>"><%=pcdata(adguard_state)%>，管理端口 3000</td></tr>
+	</table>
+</fieldset>
+
+<fieldset class="cbi-section">
+	<legend>原生管理入口</legend>
+	<div class="nradio-links">
+		<% for _, item in ipairs({
+			{"标准概览", {"admin", "status", "overview"}},
+			{"实时图表", {"admin", "status", "realtime"}},
+			{"系统日志", {"admin", "status", "syslog"}},
+			{"网络接口", {"admin", "network", "network"}},
+			{"无线网络", {"admin", "network", "wireless"}},
+			{"路由表", {"admin", "status", "routes"}},
+			{"防火墙", {"admin", "network", "firewall"}},
+			{"软件包", {"admin", "system", "packages"}},
+			{"系统设置", {"admin", "system", "system"}}
+		}) do if has_route(unpack(item[2])) then %>
+		<a href="<%=pcdata(luci.dispatcher.build_url(unpack(item[2])))%>"><%=pcdata(item[1])%></a>
+		<% end end %>
+	</div>
+</fieldset>
+
+<fieldset class="cbi-section">
+	<legend>服务入口</legend>
+	<%
+	local kp_host = tostring(http.getenv("SERVER_NAME") or ""):gsub(":%d+$", "")
+	if kp_host == "" then
+		kp_host = trim(command("ip -4 addr show br-lan | grep -m1 -oE 'inet [0-9.]+' | awk '{print $2}'")) or ""
+	end
+	kp_host = trim(kp_host or "")
+	local kp_panel_port, kp_panel_ent = "10090", ""
+	local kp_pf = io.open("/usr/local/bin/1pctl", "r")
+	if kp_pf then
+		local kp_txt = kp_pf:read("*a") or ""
+		kp_pf:close()
+		kp_panel_port = kp_txt:match("ORIGINAL_PORT=(%d+)") or kp_panel_port
+		kp_panel_ent = kp_txt:match("ORIGINAL_ENTRANCE=([%w%%-_]+)") or ""
+	end
+	local kp_panel_url = ""
+	if kp_host ~= "" then
+		kp_panel_url = "http://" .. kp_host .. ":" .. kp_panel_port
+		if kp_panel_ent ~= "" then kp_panel_url = kp_panel_url .. "/" .. kp_panel_ent end
+	end
+	local kp_docker_run = trim(command("docker ps -q 2>/dev/null | wc -l")) or ""
+	local kp_docker_all = trim(command("docker ps -aq 2>/dev/null | wc -l")) or ""
+	kp_docker_run = kp_docker_run:match("%d+") or "0"
+	kp_docker_all = kp_docker_all:match("%d+") or "0"
+	%>
+	<div class="nradio-links">
+		<a class="kp-service-card nradio-factory-link" data-nradio-path="/cgi-bin/luci/nradioadv/system/appcenter" target="_blank" rel="noopener noreferrer"><strong>鲲鹏商店</strong><span>原厂应用商店（新标签页打开）</span></a>
+		<% if kp_panel_url ~= "" then %>
+		<a class="kp-service-card" href="<%=pcdata(kp_panel_url)%>" target="_blank" rel="noopener noreferrer"><strong>1Panel 面板</strong><span>服务器面板 · 安全入口已自动识别</span></a>
+		<a class="kp-service-card" href="<%=pcdata(kp_panel_url)%>/containers" target="_blank" rel="noopener noreferrer"><strong>Docker 容器</strong><span>运行中 <%=kp_docker_run%> / 共 <%=kp_docker_all%> 个 · 点击进入容器管理</span></a>
+		<% else %>
+		<a class="kp-service-card"><strong>1Panel 面板</strong><span>服务端口 10090（本次未能自动探测入口地址，请在浏览器手动访问）</span></a>
+		<a class="kp-service-card"><strong>Docker 容器</strong><span>运行中 <%=kp_docker_run%> / 共 <%=kp_docker_all%> 个 · 守护进程 20.10</span></a>
+		<% end %>
+	</div>
+</fieldset>
+
+<fieldset class="cbi-section" id="nradio-plugin-links">
+	<legend>插件入口</legend>
+	<% if #safe_table(plugin_links.native) > 0 then %>
+	<div class="nradio-links">
+		<% for _, item in ipairs(plugin_links.native) do %>
+		<a href="<%=pcdata(luci.dispatcher.build_url(unpack(item.path)))%>"><%=pcdata(item.title)%></a>
+		<% end %>
+	</div>
+	<% end %>
+	<% if #safe_table(plugin_links.factory) > 0 then %>
+	<p class="nradio-note">以下插件使用原厂页面，在新标签页打开。</p>
+	<div class="nradio-links">
+		<% for _, item in ipairs(plugin_links.factory) do %>
+		<a class="nradio-factory-link" data-nradio-path="<%=pcdata(item.path)%>" target="_blank" rel="noopener noreferrer"><%=pcdata(item.title)%> · 原厂入口</a>
+		<% end %>
+	</div>
+	<% end %>
+	<% if #safe_table(plugin_links.native) + #safe_table(plugin_links.factory) == 0 then %>
+	<p class="nradio-note">当前未发现已注册的插件页面，安装插件后刷新本页。</p>
+	<% end %>
+	<div class="nradio-links"><a class="nradio-factory-link" data-nradio-path="/" target="_blank" rel="noopener noreferrer">NRadio 管理首页</a></div>
+	<noscript><p>启用 JavaScript 后可自动刷新状态并打开原厂入口。</p></noscript>
+</fieldset>
+
+<script type="application/json" id="nradio-initial-status"><%=initial_json%></script>
+<script type="text/javascript">
+(function() {
+	'use strict';
+	var button = document.getElementById('nradio-refresh');
+	var automatic = document.getElementById('nradio-auto-refresh');
+	var status = document.getElementById('nradio-refresh-status');
+	var cellNote = document.getElementById('nradio-cellular-note');
+	var cellBox = document.getElementById('nradio-cellular-lines');
+	var fields = document.querySelectorAll('[data-nradio-field]');
+	var endpoint = '<%=luci.dispatcher.build_url("admin", "status", "details")%>';
+	var active = null;
+	var timer = null;
+	var lastUpdated = '';
+	var stopped = false;
+	var host = window.location.hostname;
+	if (host.indexOf(':') !== -1 && host.charAt(0) !== '[') host = '[' + host + ']';
+	var factoryLinks = document.querySelectorAll('.nradio-factory-link');
+	for (var i = 0; i < factoryLinks.length; i++) {
+		factoryLinks[i].href = 'http://' + host + factoryLinks[i].getAttribute('data-nradio-path');
+	}
+
+	function text(value) {
+		return value === undefined || value === null || value === '' ? '-' : String(value);
+	}
+	function append(parent, tag, value, className) {
+		var node = document.createElement(tag);
+		node.textContent = text(value);
+		if (className) node.className = className;
+		parent.appendChild(node);
+		return node;
+	}
+	function renderCells(data) {
+		if (!data.cellular_available) {
+			cellNote.textContent = '蜂窝状态读取失败，保留上次数据显示';
+			return;
+		}
+		var lines = Array.isArray(data.lines) ? data.lines : [];
+		cellNote.textContent = lines.length ? '当前蜂窝线路' : '当前未检测到蜂窝线路';
+		var fragment = document.createDocumentFragment();
+		for (var i = 0; i < lines.length; i++) {
+			var line = lines[i];
+			var card = document.createElement('section');
+			card.className = 'nradio-cell-card';
+			var title = document.createElement('h4');
+			append(title, 'span', text(line.label) + ' · ' + text(line.name));
+			append(title, 'span', line.connection, line.up ? 'nradio-state-ok' : 'nradio-state-muted');
+			card.appendChild(title);
+			var list = document.createElement('dl');
+			var values = [
+				['运营商', line.operator], ['SIM 卡名', line.sim_name], ['网络制式', line.mode],
+				['频段', line.band], ['RSRP', line.rsrp], ['SINR', line.sinr], ['RSRQ', line.rsrq],
+				['模组温度', line.temperature], ['IPv4', line.ipaddr], ['PCI', line.pci],
+				['信道号', line.earfcn], ['默认出口', line.default_route ? '是' : '否']
+			];
+			for (var j = 0; j < values.length; j++) {
+				append(list, 'dt', values[j][0]);
+				append(list, 'dd', values[j][1]);
+			}
+			card.appendChild(list);
+			fragment.appendChild(card);
+		}
+		cellBox.textContent = '';
+		cellBox.appendChild(fragment);
+	}
+	function render(data) {
+		for (var i = 0; i < fields.length; i++) {
+			var key = fields[i].getAttribute('data-nradio-field');
+			if (Object.prototype.hasOwnProperty.call(data.fields, key)) fields[i].textContent = text(data.fields[key]);
+		}
+		renderCells(data);
+		lastUpdated = text(data.fields.current_time);
+		status.textContent = '已更新 ' + lastUpdated + (automatic.checked ? ' · 每 10 秒' : ' · 已暂停');
+	}
+	function schedule() {
+		if (timer !== null) window.clearTimeout(timer);
+		timer = null;
+		if (!stopped && automatic.checked && !document.hidden && !active) timer = window.setTimeout(refresh, 10000);
+	}
+	function refresh() {
+		if (active || document.hidden || stopped) return;
+		if (timer !== null) window.clearTimeout(timer);
+		timer = null;
+		var xhr = new XMLHttpRequest();
+		active = xhr;
+		button.disabled = true;
+		status.textContent = '正在刷新…';
+		function finish(message) {
+			if (active !== xhr) return;
+			active = null;
+			button.disabled = false;
+			if (message) status.textContent = message + (lastUpdated ? ' · 上次更新 ' + lastUpdated : '');
+			schedule();
+		}
+		xhr.open('GET', endpoint + '?refresh=1&_=' + Date.now(), true);
+		xhr.timeout = 8000;
+		xhr.onreadystatechange = function() {
+			if (xhr.readyState !== 4 || active !== xhr) return;
+			if (xhr.status === 0) return;
+			if (xhr.status === 401 || xhr.status === 403) {
+				automatic.checked = false;
+				finish('登录已失效，请刷新页面后重新登录');
+				return;
+			}
+			var data;
+			try { data = JSON.parse(xhr.responseText); } catch (error) { data = null; }
+			if (xhr.status !== 200 || !data || data.ok !== true || data.version !== '20260925-1' || !data.fields) {
+				finish('刷新失败，请重试；若登录已失效，请刷新页面');
+				return;
+			}
+			render(data);
+			finish('');
+		};
+		xhr.onerror = function() { finish('网络连接失败，保留上次数据显示'); };
+		xhr.ontimeout = function() { finish('刷新超时，保留上次数据显示'); };
+		xhr.send(null);
+	}
+	button.addEventListener('click', refresh);
+	automatic.addEventListener('change', function() {
+		status.textContent = (automatic.checked ? '自动刷新已开启' : '自动刷新已暂停') + (lastUpdated ? ' · 上次更新 ' + lastUpdated : '');
+		if (automatic.checked) refresh(); else schedule();
+	});
+	document.addEventListener('visibilitychange', function() {
+		if (document.hidden) {
+			if (timer !== null) window.clearTimeout(timer);
+			timer = null;
+			if (active) { var xhr = active; active = null; xhr.abort(); button.disabled = false; }
+		} else if (automatic.checked) refresh();
+	});
+	window.addEventListener('pagehide', function() {
+		stopped = true;
+		if (timer !== null) window.clearTimeout(timer);
+		timer = null;
+		if (active) { var xhr = active; active = null; xhr.abort(); }
+	});
+	window.addEventListener('pageshow', function() {
+		stopped = false;
+		button.disabled = false;
+		schedule();
+	});
+	try {
+		var initial = JSON.parse(document.getElementById('nradio-initial-status').textContent);
+		if (initial.ok && initial.fields) render(initial);
+	} catch (error) { status.textContent = '点击刷新状态以读取最新数据'; }
+	schedule();
+})();
+</script>
+</div>
+
+<%+footer%>

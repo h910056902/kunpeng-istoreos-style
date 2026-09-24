@@ -2,3 +2,5 @@
 *.md text
 *.lua text eol=lf
 *.htm text eol=lf
+*.py text eol=lf
+*.uci text eol=lf
