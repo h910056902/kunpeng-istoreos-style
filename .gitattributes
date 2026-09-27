@@ -4,3 +4,4 @@
 *.htm text eol=lf
 *.py text eol=lf
 *.uci text eol=lf
+*.snippet text eol=lf

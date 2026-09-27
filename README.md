@@ -96,3 +96,19 @@ docs/
 ## License
 
 MIT
+
+## 子项目：`portal-istoreos/` —— 门户弹层内嵌 8080 + 小字开关
+
+把 80 端口门户 `http://<lan>/cgi-bin/portal` 的「高级配置」弹层，
+指向 **`http://<lan>:8080/cgi-bin/luci/admin/quickstart/`**（原先是错误的 istorerouter），
+并在弹层里加一个**设备级生效**的「小字：已显示 / 已隐藏」开关（偏好存 UCI，默认显示）。
+
+**一行命令安装**（SSH 到设备，root）：
+
+```sh
+wget -qO /tmp/kp-portal.sh https://raw.githubusercontent.com/h910056902/kunpeng-istoreos-style/main/portal-istoreos/install.sh && sh /tmp/kp-portal.sh
+```
+
+回滚：`ROLLBACK=1 sh /tmp/kp-portal.sh`
+
+详见 [portal-istoreos/README.md](portal-istoreos/README.md)。
