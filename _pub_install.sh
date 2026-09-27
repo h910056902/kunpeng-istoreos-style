@@ -4,7 +4,7 @@
 # ----------------------------------------------------------------------------
 #  用法（设备上，SSH 或 Web 终端）：
 #    wget -qO /tmp/kp-portal.sh \
-#      https://raw.githubusercontent.com/h910056902/kunpeng-istoreos-style/main/portal-istoreos/install.sh \
+#      https://raw.githubusercontent.com/h910056902/kunpeng-router-tuning/main/portal-istoreos/install.sh \
 #      && sh /tmp/kp-portal.sh
 #
 #  本脚本只负责「把 kp-portal.sh 拉下来并执行」，自身极简、不碰系统。
