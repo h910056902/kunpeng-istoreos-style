@@ -78,10 +78,11 @@ tools/                               # PC 侧工具
 docs/
   DESIGN.md                          # 8080 实例架构逆向 + 主题升级评估
   TROUBLESHOOTING.md                 # 踩坑记录
-exe-installer/                       # Windows 一键安装器（源码，可自行打包）
+portal-istoreos/exe-installer/       # Windows 一键安装器（源码 + 成品 exe）
   kp_portal_installer.py             # 安装 + 恢复 8080 环境（GUI / CLI）
-  build_exe.py                       # 打包成单文件 exe
-  payload/                           # 内嵌的 portal.lua + 自愈守卫
+  build_exe.py                       # 打包成单文件 exe（带 tkinter 预检）
+  payload/                           # 内嵌的 portal.lua(v3) + 自愈守卫
+  鲲鹏门户安装器.exe                  # 已打包好的成品，双击即用
 scripts/
   kp-8080-backup.py                  # 备份 8080 全量状态到 PC
 ```
@@ -103,7 +104,7 @@ python scripts\kp-8080-backup.py --out D:\bak\8080 --tar
 
 **② 恢复（用 exe）**
 
-双击 `exe-installer` 打出的 exe → 填地址密码 → 点「恢复 8080 环境」→ 选备份目录。
+双击 `portal-istoreos/exe-installer/鲲鹏门户安装器.exe` → 填地址密码 → 点「恢复 8080 环境」→ 选备份目录。
 
 ```bat
 set ROUTER_PW=你的密码

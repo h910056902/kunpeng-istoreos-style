@@ -39,6 +39,12 @@ MAIN_DST = ("/overlay/nradio-apps/openwrt-luci-8080/usr/lib/lua/luci/"
 GUARD_DST = "/usr/bin/kp-portal-guard.sh"
 GOLD_DIR = "/root/kp-portal-gold"
 
+# --- 8080 环境恢复（--restore / 界面「恢复 8080」）---
+APP8080 = "/overlay/nradio-apps/openwrt-luci-8080"
+MENU_D = "/usr/share/luci/menu.d"
+RESTORE_CONFIGS = ["/etc/config/uhttpd", "/etc/config/istore",
+                   "/etc/config/istorerouter", "/etc/config/kp_portal"]
+
 CHUNK_BYTES = 700   # 每块原始字节数（八进制后 x4 字符，保守值防断流）
 MAX_RETRY = 5
 
@@ -160,6 +166,207 @@ class Deployer:
                       % (remote_path, remote_path, remote_path))
         self.log("  ✓ %s 已落地（md5 %s）" % (remote_path, got_md5))
         return got_md5
+
+    # ---------- 8080 环境恢复 ----------
+    def restore_8080(self, backup_dir):
+        """
+        把备份目录里的 8080 全量状态推回设备。
+        backup_dir 结构（kp-8080-backup.py 产出）：
+            app8080/...             → /overlay/nradio-apps/openwrt-luci-8080/...
+            app8080.SYMLINKS        → 软链清单
+            menu.d/...              → /usr/share/luci/menu.d/...
+            config/<name>           → /etc/config/<name>
+            MANIFEST.txt            → 校验清单
+        """
+        import hashlib
+
+        self.backup_dir_ref = backup_dir
+        man = os.path.join(backup_dir, "MANIFEST.txt")
+        if not os.path.isfile(man):
+            raise RuntimeError("备份目录无效：找不到 MANIFEST.txt")
+
+        # 解析清单
+        files, links = [], []
+        for line in open(man, encoding="utf-8"):
+            if line.startswith("#") or not line.strip():
+                continue
+            p = line.rstrip("\n").split("\t")
+            if len(p) != 4:
+                continue
+            kind, rpath, h, size = p
+            if kind == "symlink":
+                links.append((rpath, h))
+            elif kind == "file":
+                files.append((rpath, h, int(size)))
+
+        self.log("")
+        self.log("【恢复 1/5】前置检查")
+        host = self.run_safe("cat /proc/sys/kernel/hostname 2>/dev/null")
+        self.log("  主机名 : %s" % host)
+        if not self.run_safe("test -d /overlay/nradio-apps && echo YES"):
+            raise RuntimeError("未发现 /overlay/nradio-apps —— 不是鲲鹏 8080 环境")
+        self.log("  ✓ 环境 OK（备份含 %d 文件 / %d 软链）"
+                 % (len(files), len(links)))
+
+        # 备份设备现状
+        self.log("")
+        self.log("【恢复 2/5】备份设备现状")
+        stamp = self.run_safe("date +%Y%m%d_%H%M%S")
+        bak = "/root/kp-8080-restore-bak-%s" % stamp
+        self.run_safe("mkdir -p %s" % bak)
+        for d, name in [(APP8080, "app8080"), (MENU_D, "menu.d")]:
+            self.run_safe("tar -czf %s/%s.tgz -C %s . 2>/dev/null || true"
+                          % (bak, name, d))
+        for c in RESTORE_CONFIGS:
+            self.run_safe("[ -f %s ] && cp -f %s %s/%s.bak 2>/dev/null || true"
+                          % (c, c, bak, os.path.basename(c)))
+        self.log("  ✓ 现状已备份 → %s" % bak)
+
+        # 映射本地备份文件 → 设备路径
+        self.log("")
+        self.log("【恢复 3/5】推送文件")
+        ok = fail = 0
+        plan = []
+        for rpath, want_md5, _ in files:
+            if rpath.startswith(APP8080 + "/"):
+                rel = rpath[len(APP8080) + 1:]
+                local = os.path.join(backup_dir, "app8080", rel)
+            elif rpath.startswith(MENU_D + "/"):
+                rel = rpath[len(MENU_D) + 1:]
+                local = os.path.join(backup_dir, "menu.d", rel)
+            elif rpath.startswith("/etc/config/"):
+                local = os.path.join(backup_dir, "config",
+                                     os.path.basename(rpath))
+            else:
+                continue
+            plan.append((local, rpath, want_md5))
+
+        for i, (local, rpath, want_md5) in enumerate(plan, 1):
+            if not os.path.isfile(local):
+                self.log("  ✗ 本地缺失，跳过 %s" % rpath)
+                fail += 1
+                continue
+            data = open(local, "rb").read()
+            # 本地先自校验（防备份本身坏了）
+            if hashlib.md5(data).hexdigest() != want_md5:
+                self.log("  ✗ 备份文件损坏，跳过 %s" % rpath)
+                fail += 1
+                continue
+            self.run_safe("mkdir -p '%s'" % os.path.dirname(rpath))
+            try:
+                self.push_file(data, rpath, label="")
+                ok += 1
+            except Exception as e:
+                self.log("  ✗ 推送失败 %s : %s" % (rpath, e))
+                fail += 1
+            if i % 10 == 0 or i == len(plan):
+                self.log("  · %d/%d" % (i, len(plan)))
+        self.log("  ✓ 推送完成：成功 %d / 失败 %d" % (ok, fail))
+
+        # 重建软链
+        self.log("")
+        self.log("【恢复 4/5】重建软链")
+        self._restore_symlinks(links, backup_dir)
+
+        # 重启服务
+        self.log("")
+        self.log("【恢复 5/5】重启服务 + 验收")
+        self.run_safe("rm -f /tmp/luci-indexcache; "
+                      "rm -rf /tmp/luci-modulecache/*; "
+                      "/etc/init.d/uhttpd restart >/dev/null 2>&1; "
+                      "sleep 2; echo done")
+        self.log("  ✓ uhttpd 已重启")
+        self._accept_8080(bak, fail)
+
+    def _restore_symlinks(self, links, backup_dir):
+        """按 app8080.SYMLINKS 重建软链（先删后建，目标可能是绝对路径）。"""
+        # 优先用备份里落盘的清单（含目标），MANIFEST 里也有
+        symfile = os.path.join(backup_dir, "app8080.SYMLINKS")
+        pairs = list(links)
+        if os.path.isfile(symfile):
+            pairs = []
+            for line in open(symfile, encoding="utf-8"):
+                if "\t" in line:
+                    a, b = line.rstrip("\n").split("\t", 1)
+                    pairs.append((a.strip(), b.strip()))
+
+        made = 0
+        for rel, target in pairs:
+            # rel 形如 ./www/luci-static/nradio（相对 APP8080）
+            r = rel
+            if r.startswith("./"):
+                r = r[2:]
+            remote = APP8080 + "/" + r
+            self.run_safe("mkdir -p '%s'" % os.path.dirname(remote))
+            self.run_safe("rm -f '%s'; ln -s '%s' '%s'"
+                          % (remote, target, remote))
+            made += 1
+        self.log("  ✓ 软链 %d 条已重建" % made)
+
+    def _accept_8080(self, bak, push_fail):
+        """8080 恢复后的验收。"""
+        self.log("")
+        self.log("  验收：")
+        results = []
+
+        # CGI md5 与备份一致
+        man = None
+        for line in open(os.path.join(self.backup_dir_ref, "MANIFEST.txt"),
+                         encoding="utf-8"):
+            if "/www/cgi-bin/luci\t" in line and line.startswith("file"):
+                man = line.rstrip("\n").split("\t")[2]
+                break
+        cur = self.run_safe("md5sum %s/www/cgi-bin/luci | awk '{print $1}'"
+                            % APP8080).strip()
+        results.append(("8080 CGI md5", bool(man) and cur == man, cur))
+
+        # KP 补丁标记齐全（应 ≥10）
+        mk = self.run_safe(
+            "grep -oE 'KP-[A-Z0-9-]+( v[0-9]+)?' %s/www/cgi-bin/luci "
+            "2>/dev/null | sort -u | wc -l" % APP8080).strip()
+        try:
+            nk = int(mk)
+        except ValueError:
+            nk = 0
+        results.append(("KP 补丁标记", nk >= 10, "%s 个" % nk))
+
+        # 软链就位
+        lk = self.run_safe(
+            "ls -l %s/www/luci-static/ | grep -c '^l'" % APP8080).strip()
+        try:
+            nl = int(lk)
+        except ValueError:
+            nl = 0
+        results.append(("luci-static 软链", nl >= 8, "%s 条" % nl))
+
+        # 8080 监听
+        listen = self.run_safe(
+            "netstat -ltn 2>/dev/null | grep -c ':8080' || echo 0").strip()
+        results.append(("8080 监听", listen not in ("0", ""), listen))
+
+        # 8080 根路径可达
+        code = self.run_safe(
+            "curl -s -o /dev/null -w '%%{http_code}' http://%s:8080/"
+            % self.host).strip()
+        results.append(("8080 HTTP 根", code in ("200", "302"), code))
+
+        # 未登录应为 403（登录墙）
+        code2 = self.run_safe(
+            "curl -s -o /dev/null -w '%%{http_code}' "
+            "http://%s:8080/cgi-bin/luci/admin/istorerouter"
+            % self.host).strip()
+        results.append(("istorerouter 登录墙", code2 == "403", code2))
+
+        for name, good, detail in results:
+            self.log("  %s %-24s %s" % ("✓" if good else "✗", name, detail))
+            self.notes.append((name, good, detail))
+
+        self.notes.append(("推送失败数", push_fail == 0, str(push_fail)))
+        self.log("")
+        self.log("  回滚命令（设备上执行）：")
+        self.log("    tar -xzf %s/app8080.tgz -C %s" % (bak, APP8080))
+        self.log("    tar -xzf %s/menu.d.tgz  -C %s" % (bak, MENU_D))
+        self.log("    /etc/init.d/uhttpd restart")
 
     # ---------- 主流程 ----------
     def deploy(self):
@@ -299,12 +506,12 @@ class Deployer:
 # ===========================================================================
 def run_gui():
     import tkinter as tk
-    from tkinter import ttk, messagebox, scrolledtext
+    from tkinter import ttk, messagebox, scrolledtext, filedialog
 
     root = tk.Tk()
     root.title("%s v%s" % (APP_TITLE, VERSION))
-    root.geometry("720x540")
-    root.minsize(640, 460)
+    root.geometry("720x560")
+    root.minsize(640, 480)
 
     style = ttk.Style()
     try:
@@ -344,6 +551,9 @@ def run_gui():
     status = ttk.Label(frm, text="就绪", foreground="#297ff3")
     status.grid(row=5, column=0, columnspan=2, sticky="w")
 
+    btn_restore = ttk.Button(frm, text="恢复 8080 环境", width=16)
+    btn_restore.grid(row=5, column=2, sticky="e", padx=(0, 8))
+
     btn = ttk.Button(frm, text="开始安装", width=14)
     btn.grid(row=5, column=3, sticky="e")
 
@@ -354,24 +564,37 @@ def run_gui():
 
     done = {"ok": False}
 
-    def work():
+    def _prep():
+        """把两个按钮都锁上，返回 (host, user, pw) 或 None。"""
         host = e_host.get().strip() or DEFAULT_HOST
         user = e_user.get().strip() or DEFAULT_USER
         pw = e_pw.get()
         if not pw:
             messagebox.showwarning("缺少密码", "请输入路由器 SSH 密码。")
-            btn.config(state="normal")
             status.config(text="已取消")
-            return
+            return None
+        btn.config(state="disabled")
+        btn_restore.config(state="disabled")
+        out.delete("1.0", "end")
+        return host, user, pw
 
+    def _unlock():
+        btn.config(state="normal")
+        btn_restore.config(state="normal")
+        root.update_idletasks()
+
+    def work():
+        pre = _prep()
+        if not pre:
+            return
+        host, user, pw = pre
+        btn.config(text="安装中…")
+        status.config(text="正在安装…", foreground="#297ff3")
         d = Deployer(host, user, pw, log)
         try:
             d.connect()
             d.deploy()
-            ok = True
-            for n, o, _ in d.notes:
-                if not o:
-                    ok = False
+            ok = all(o for _, o, _ in d.notes)
             done["ok"] = ok
             log("")
             if ok:
@@ -397,17 +620,62 @@ def run_gui():
             status.config(text="安装失败", foreground="#f56c6c")
         finally:
             d.close()
-            btn.config(state="normal")
             btn.config(text="重新安装")
-            root.update_idletasks()
+            _unlock()
+
+    def work_restore():
+        pre = _prep()
+        if not pre:
+            return
+        host, user, pw = pre
+        bdir = filedialog.askdirectory(
+            title="选择备份目录（含 MANIFEST.txt，例如 kp-8080-backup-live）")
+        if not bdir:
+            status.config(text="已取消")
+            _unlock()
+            return
+        btn_restore.config(text="恢复中…")
+        status.config(text="正在恢复 8080…", foreground="#297ff3")
+        log("=" * 56)
+        log("  恢复 8080 环境 ← %s" % bdir)
+        log("=" * 56)
+        d = Deployer(host, user, pw, log)
+        try:
+            d.connect()
+            d.restore_8080(bdir)
+            ok = all(o for _, o, _ in d.notes)
+            done["ok"] = ok
+            log("")
+            if ok:
+                log("=" * 56)
+                log("  恢复完成 —— 全部自检通过")
+                log("=" * 56)
+                log("  8080 已回到备份时的状态：")
+                log("  %s:8080/cgi-bin/luci/admin/istorerouter" % host)
+                status.config(text="恢复成功", foreground="#008236")
+            else:
+                log("=" * 56)
+                log("  恢复完成，但有项目未通过（见上方 ✗）")
+                log("=" * 56)
+                status.config(text="有项目未通过", foreground="#e6a23c")
+        except Exception as ex:
+            log("")
+            log("!!! 恢复失败：%s" % ex)
+            log(traceback.format_exc())
+            status.config(text="恢复失败", foreground="#f56c6c")
+        finally:
+            d.close()
+            btn_restore.config(text="恢复 8080 环境")
+            _unlock()
 
     def on_click():
-        btn.config(state="disabled", text="安装中…")
-        status.config(text="正在安装…", foreground="#297ff3")
-        out.delete("1.0", "end")
         threading.Thread(target=work, daemon=True).start()
 
+    def on_restore():
+        threading.Thread(target=work_restore, daemon=True).start()
+
     btn.config(command=on_click)
+    btn_restore.config(command=on_restore)
     e_pw.bind("<Return>", lambda _e: on_click())
     e_pw.focus_set()
 
@@ -416,6 +684,8 @@ def run_gui():
     log("=" * 56)
     log("  默认目标：%s（SSH root）" % DEFAULT_HOST)
     log("  输入密码后点「开始安装」。")
+    log("  想回滚 8080 环境，点「恢复 8080 环境」并选备份目录")
+    log("  （目录里要有 MANIFEST.txt，例如 kp-8080-backup-live）。")
     log("")
 
     root.mainloop()
@@ -451,7 +721,20 @@ def run_cli():
     d = Deployer(host, user, pw, log)
     try:
         d.connect()
-        d.deploy()
+
+        # ---- 恢复模式 ----
+        if "--restore" in sys.argv:
+            i = sys.argv.index("--restore")
+            if i + 1 >= len(sys.argv):
+                print("--restore 需要跟一个备份目录", file=sys.stderr)
+                return 2
+            bdir = sys.argv[i + 1]
+            log("=" * 56)
+            log("  恢复 8080 环境：%s" % os.path.abspath(bdir))
+            log("=" * 56)
+            d.restore_8080(bdir)
+        else:
+            d.deploy()
     except Exception as ex:
         print("FAIL:", ex)
         traceback.print_exc()

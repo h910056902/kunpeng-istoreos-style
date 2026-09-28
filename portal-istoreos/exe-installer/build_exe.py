@@ -113,14 +113,20 @@ def main():
         # ⚠️ 用「改名让位」代替 os.remove —— 某些环境（沙箱/安全软件）
         #    会把删除操作拦到回收站并失败，导致整个构建半途炸掉。
         #    改名是纯元数据操作，不会被拦。
+        #
+        # ⚠️ 坑：**绝不能动 `built`**。曾这样写：
+        #       os.replace(built, stale)   # ← 把刚打好的 exe 搬走了
+        #       os.replace(final, stale)   # ← 又把旧产物搬到同一路径，覆盖
+        #       os.replace(built, final)   # ← built 已经不在了 → FileNotFoundError
+        #    结果：构建报错 + 新旧产物全丢。正确做法是只给 *旧产物* 找空位。
         if os.path.exists(final):
-            stale = final + ".old"
-            if os.path.exists(stale):
-                try:
-                    os.replace(built, stale)   # 先占用 .old 名，再把旧的挤走
-                except OSError:
-                    pass
-            os.replace(final, stale)           # 旧的 → .old（不删）
+            for i in range(1, 100):
+                stale = "%s.old%d" % (final, i)
+                if not os.path.exists(stale):
+                    break
+            else:
+                raise SystemExit("让位失败：%s.old1..99 都被占用，请手动清理" % final)
+            os.replace(final, stale)           # 旧的 → .old<N>（不删）
             log("旧产物已让位 → %s" % os.path.basename(stale))
         os.replace(built, final)
 
