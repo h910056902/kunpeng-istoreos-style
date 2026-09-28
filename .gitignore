@@ -1,0 +1,5 @@
+exe-installer/dist/
+exe-installer/build/
+exe-installer/__pycache__/
+exe-installer/*.spec
+scripts/__pycache__/

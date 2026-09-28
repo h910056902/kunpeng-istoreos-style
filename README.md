@@ -78,7 +78,46 @@ tools/                               # PC 侧工具
 docs/
   DESIGN.md                          # 8080 实例架构逆向 + 主题升级评估
   TROUBLESHOOTING.md                 # 踩坑记录
+exe-installer/                       # Windows 一键安装器（源码，可自行打包）
+  kp_portal_installer.py             # 安装 + 恢复 8080 环境（GUI / CLI）
+  build_exe.py                       # 打包成单文件 exe
+  payload/                           # 内嵌的 portal.lua + 自愈守卫
+scripts/
+  kp-8080-backup.py                  # 备份 8080 全量状态到 PC
 ```
+
+## 备份与恢复 8080 环境
+
+8080 实例不是 opkg 管理的 —— 全是手放的 `overlay` 文件 + 软链，
+一旦被改坏（比如固件自更新覆写、误删软链）很难重建。所以提供了一对工具：
+
+**① 备份（PC 侧）**
+
+```bat
+python scripts\kp-8080-backup.py --out D:\bak\8080 --tar
+```
+
+抓到：8080 docroot 全量文件、`luci-static` 软链、`menu.d`、UCI 配置
+（uhttpd / istore / istorerouter / kp_portal / quickstart）、`opkg list-installed`。
+本机基准：**77 文件 / 1.3 MB**，tar.gz 约 **532 KB**，逐文件写 `MANIFEST.txt`。
+
+**② 恢复（用 exe）**
+
+双击 `exe-installer` 打出的 exe → 填地址密码 → 点「恢复 8080 环境」→ 选备份目录。
+
+```bat
+set ROUTER_PW=你的密码
+鲲鹏门户安装器.exe --cli --restore "D:\bak\8080"
+```
+
+恢复会**先把设备现状再备份一次**到 `/root/kp-8080-restore-bak-<时间戳>/`，
+再推送文件、重建软链、重启 uhttpd，最后 6 项验收。
+
+> **真机破坏性实测**：故意把 CGI 打成垃圾、删掉 `main.htm` / `overview.htm`、
+> 砍掉 5 条软链（9→4）、删 2 个 `menu.d`（4→2），再用 exe 恢复 ——
+> **77/77 文件推送成功、0 失败**；独立核对 **77/77 文件 md5 与基线逐字节一致**，
+> 17 个 KP 补丁标记、9 条软链、4 个 `menu.d` 全部回来，
+> 登录后 `istorerouter` / `quickstart` 均 200。
 
 ## 运行环境
 
