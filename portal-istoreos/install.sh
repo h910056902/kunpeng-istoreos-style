@@ -58,7 +58,7 @@ SIZE="$(wc -c < "$TMP/kp-portal.sh" | tr -d ' ')"
 [ "$SIZE" -gt 1000 ] || die "下载内容异常（$SIZE 字节），疑似被劫持/404"
 ok "kp-portal.sh 就绪（$SIZE 字节）"
 
-# ---- 拉 payload（v3 只需 portal.lua）----
+# ---- 拉 payload 与守卫 ----
 mkdir -p "$TMP/payload"
 for f in portal.lua; do
 	if get "$BASE/payload/$f" "$TMP/payload/$f"; then
@@ -68,6 +68,14 @@ for f in portal.lua; do
 		rm -f "$TMP/payload/$f"
 	fi
 done
+
+# 自愈守卫（防 nr_webui 自更新把 portal 覆写回原厂 1.0）
+if get "$BASE/kp-portal-guard.sh" "$TMP/kp-portal-guard.sh"; then
+	ok "kp-portal-guard.sh（$(wc -c < "$TMP/kp-portal-guard.sh" | tr -d ' ') 字节）"
+else
+	log "kp-portal-guard.sh 拉取失败 —— 守卫将不安装（门户仍可用，但可能被覆写）"
+	rm -f "$TMP/kp-portal-guard.sh"
+fi
 
 # ---- 执行（payload 与脚本同目录，会被优先采用）----
 echo

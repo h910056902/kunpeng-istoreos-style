@@ -25,6 +25,31 @@ curl -fsSL https://raw.githubusercontent.com/h910056902/kunpeng-istoreos-style/m
 
 ---
 
+## Windows 一键安装器（exe，推荐给不想用命令行的场景）
+
+`exe-installer/dist/鲲鹏门户安装器.exe` —— **双击即用，无需装 Python / 无需命令行**。
+
+流程：**双击 → 填地址和密码 → 自动 SSH 部署 + 装守卫 → 逐项自检回报**。
+
+- 默认目标 `192.168.66.1`（SSH `root`），可在界面改。
+- **密码只在内存里用**：不写盘、不存 exe 里；exe 里也没有任何硬编码密码。
+- 界面里有实时日志与 11 项验收结果（✓/✗）。
+- 附带 CLI 模式（供自动化/排障）：
+
+  ```bat
+  set ROUTER_PW=你的密码
+  鲲鹏门户安装器.exe --cli
+  ```
+
+自己重新构建：
+
+```bat
+cd exe-installer
+python build_exe.py
+```
+
+---
+
 ## 四张卡片（v3 的重新规划）
 
 | 卡片 | 行为 | 目标 |
@@ -147,6 +172,50 @@ curl -fsSL https://raw.githubusercontent.com/h910056902/kunpeng-istoreos-style/m
 10. **本改动不碰 80 端口官方视图**
     `/usr/lib/lua/luci/view/quickstart/main.htm`（官方）保持原样，避免影响原厂界面。
 
+11. **`nr_webui` 二进制内嵌了原厂 portal 1.0，自更新时会覆写回去** ⭐⭐
+    `/root/nr_webui`（WebUI V2.0.28）里**完整内嵌了 portal 1.0 的源码**，
+    并在**启动 / 自更新时**执行 `write /www/cgi-bin/portal`，
+    把我们的 v3 覆盖回原厂版（**2026-09-28 11:00 实测发生过一次**，portal 变回
+    `c2a8e10e…` / 6389 B）。
+
+    判据（怎么确认是这个原因）：
+
+    ```sh
+    strings /root/nr_webui | grep -E 'NRWEBUI_PORTAL|write /www/cgi-bin/portal'
+    #   → -- NRWEBUI_PORTAL=1.0
+    #   → write /www/cgi-bin/portal
+    ls -l /root/nr_webui          # mtime 与你发现门户被还原的时间吻合
+    ```
+
+    **实测：普通 HTTP 请求不会触发**（反复 `curl` 门户不会还原），
+    只有 nr_webui 自身重启/自更新才触发 → 所以「不是你的脚本坏了」。
+
+    **修法不是抢写入权**（抢不过，而且会打乒乓），而是 **分钟级自愈**：
+    `kp-portal-guard.sh` + cron `* * * * *`，检测 md5 不对就立刻从金样本打回。
+    金样本在 `/root/kp-portal-gold/portal.v3`，缺失时自动从备份或云端补拉。
+
+    ```sh
+    crontab -l | grep kp-portal-guard
+    #   → * * * * * /usr/bin/kp-portal-guard.sh >/dev/null 2>&1
+    tail -5 /var/log/kp-portal-guard.log
+    #   → 2026-09-28 11:47:37 portal 被覆盖(旧=35ed753b…) → 已打回 v3
+    ```
+
+    ⚠️ **crontab 行里严禁写 `$(...)` / `%`** —— busybox cron 会提前展开/转义，任务直接失效。
+
+12. **8080 的 LuCI 登录是 POST 到「重定向目标」，不是 `/cgi-bin/luci/`** ⭐
+    未登录时 `GET /cgi-bin/luci/admin/xxx` → `302` 到 `/cgi-bin/luci/admin/status/details`，
+    **登录表单的 `action` 就是那个重定向目标**：
+
+    ```
+    <form class="form-login" method="post" action="/cgi-bin/luci/admin/status/details">
+    ```
+
+    所以 `POST` 打到 `/cgi-bin/luci/` 会 **404**（我一开始就踩了这个）。
+    正确做法：先 `GET` 拿 302 的 `Location`，再 `POST` 到那个地址，
+    才会拿到 `Set-Cookie: sysauth=…; path=/cgi-bin/luci/`。
+    拿到 cookie 后 `istorerouter` / `quickstart` 才返回 200。
+
 ---
 
 ## 回滚
@@ -171,14 +240,21 @@ rm -f /tmp/luci-indexcache; rm -rf /tmp/luci-modulecache/*
 ```
 portal-istoreos/
 ├── README.md                       # 本文件
-├── install.sh                      # 一行命令入口（拉 kp-portal.sh + payload 并执行）
-├── kp-portal.sh                    # 真正干活的补丁器（幂等 + 备份 + 回滚）
-└── payload/
-    └── portal.lua                  # v3 门户（md5 9360ce8c…，14423 B）
+├── install.sh                      # 一行命令入口（拉 kp-portal.sh + payload + 守卫 并执行）
+├── kp-portal.sh                    # 真正干活的补丁器（幂等 + 备份 + 回滚 + 装守卫）
+├── kp-portal-guard.sh              # 自愈守卫（cron 每分钟，防 nr_webui 覆写）
+├── payload/
+│   └── portal.lua                  # v3 门户（md5 9360ce8c…，14423 B）
+└── ../exe-installer/               # Windows 一键安装器源码 + 产物
+    ├── kp_portal_installer.py      #   安装器主程序（GUI + CLI）
+    ├── build_exe.py                #   打包脚本
+    ├── payload/                    #   构建时自动同步的权威源
+    └── dist/鲲鹏门户安装器.exe      #   ★ 双击即用产物（13.3 MB）
 ```
 
 `install.sh` 只做下载 + 转交；`kp-portal.sh` 是唯一有写操作的地方，
 每次运行都会先备份，可用 `ROLLBACK=1` 撤销。
+`kp-portal-guard.sh` 常驻 cron，负责把被覆写的门户自动打回。
 
 ---
 
@@ -201,7 +277,20 @@ grep -o 'admin/istorerouter' /www/cgi-bin/portal | head -1
 
 # 5) 80 端口官方视图未被改动
 md5sum /usr/lib/lua/luci/view/quickstart/main.htm
+
+# 6) 自愈守卫在跑
+crontab -l | grep kp-portal-guard
+ls -l /usr/bin/kp-portal-guard.sh /root/kp-portal-gold/portal.v3
 ```
 
 浏览器侧：进门户 → 点「istore os风格化」→ 弹层应是 **iStoreRouter**
 （未登录先出登录页，登录后进 SPA）；「高级设置」应在**新标签**打开 quickstart。
+
+故意把 portal 改坏，验证守卫能自己打回：
+
+```sh
+echo 'x' > /www/cgi-bin/portal
+sleep 70                       # 等 cron 跑一拍
+md5sum /www/cgi-bin/portal     # → 9360ce8c…（已自动恢复）
+tail -1 /var/log/kp-portal-guard.log
+```

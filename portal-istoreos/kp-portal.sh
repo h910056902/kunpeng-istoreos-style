@@ -117,7 +117,7 @@ ok "备份就绪（回滚：ROLLBACK=1 sh $0）"
 # ---------------------------------------------------------------------------
 # 5. 部署 portal
 # ---------------------------------------------------------------------------
-echo "== [1/3] 部署 portal（四卡片 iStoreOS 风格）=="
+echo "== [1/4] 部署 portal（四卡片 iStoreOS 风格）=="
 cp -f "$SRC_PORTAL" "$PORTAL_DST"
 chmod 755 "$PORTAL_DST"
 GOT="$(md5of "$PORTAL_DST")"
@@ -141,7 +141,7 @@ fi
 # ---------------------------------------------------------------------------
 # 6. 清理历史「小字开关」注入块（可选）
 # ---------------------------------------------------------------------------
-echo "== [2/3] 历史小字开关残留 =="
+echo "== [2/4] 历史小字开关残留 =="
 if [ -f "$MAIN_DST" ] && grep -qF "$LEGACY_BEGIN" "$MAIN_DST" 2>/dev/null; then
 	if [ "${KP_CLEAN_NOSMALL:-0}" = "1" ]; then
 		awk -v beg="$LEGACY_BEGIN" -v end='KP-QUICKSTART-NOSMALLTEXT v1 END -->' '
@@ -166,15 +166,57 @@ if [ -f /etc/config/kp_portal ]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 7. 清缓存 + 重启
+# 7. 安装自愈守卫（防 nr_webui 自更新把 portal 覆写回原厂 1.0）
 # ---------------------------------------------------------------------------
-echo "== [3/3] 清缓存 + 重启 uhttpd =="
+echo "== [3/4] 安装自愈守卫（kp-portal-guard）=="
+GUARD_DST='/usr/bin/kp-portal-guard.sh'
+GOLD='/root/kp-portal-gold'
+
+SRC_GUARD=''
+for c in "$SCRIPT_DIR/kp-portal-guard.sh" "$SCRIPT_DIR/payload/kp-portal-guard.sh"; do
+	[ -f "$c" ] && { SRC_GUARD="$c"; break; }
+done
+if [ -z "$SRC_GUARD" ]; then
+	log "本地无守卫脚本，从远端拉取…"
+	get "$RAW_BASE/kp-portal-guard.sh" "$TMP/kp-portal-guard.sh" && SRC_GUARD="$TMP/kp-portal-guard.sh" || warn "守卫脚本拉取失败（跳过守卫安装）"
+fi
+
+if [ -n "$SRC_GUARD" ]; then
+	cp -f "$SRC_GUARD" "$GUARD_DST"
+	chmod 755 "$GUARD_DST"
+	# 金样本 = 刚装好的这份
+	mkdir -p "$GOLD"
+	cp -f "$PORTAL_DST" "$GOLD/portal.v3"
+	[ -f "$MAIN_DST" ] && cp -f "$MAIN_DST" "$GOLD/main.htm" || true
+	ok "守卫已装 → $GUARD_DST（金样本 $GOLD/portal.v3）"
+
+	# 注册 cron（每分钟自检）
+	#   ⚠️ 严禁在 crontab 行里写 $(...) / %（busybox cron 会提前展开 / 转义）
+	CRON_LINE='* * * * * /usr/bin/kp-portal-guard.sh >/dev/null 2>&1'
+	if crontab -l 2>/dev/null | grep -qF 'kp-portal-guard.sh'; then
+		ok "cron 已存在（跳过注册）"
+	else
+		{ crontab -l 2>/dev/null; echo "$CRON_LINE"; } | crontab -
+		/etc/init.d/cron restart >/dev/null 2>&1 || /etc/init.d/cron reload >/dev/null 2>&1 || true
+		ok "cron 已注册（每分钟自愈）"
+	fi
+
+	# 立即跑一次验证
+	"$GUARD_DST" >/dev/null 2>&1 && ok "守卫首次执行 ok" || warn "守卫首次执行异常（见 /var/log/kp-portal-guard.log）"
+else
+	warn "未安装守卫 —— nr_webui 自更新时 portal 可能被覆写"
+fi
+
+# ---------------------------------------------------------------------------
+# 8. 清缓存 + 重启
+# ---------------------------------------------------------------------------
+echo "== [4/4] 清缓存 + 重启 uhttpd =="
 rm -f /tmp/luci-indexcache 2>/dev/null || true
 rm -rf /tmp/luci-modulecache/* 2>/dev/null || true
 /etc/init.d/uhttpd restart >/dev/null 2>&1 || warn "uhttpd 重启失败"
 
 # ---------------------------------------------------------------------------
-# 8. 收尾 + 自检
+# 9. 收尾 + 自检
 # ---------------------------------------------------------------------------
 CODE="$(curl -s -o /dev/null -w '%{http_code}' 'http://127.0.0.1/cgi-bin/portal' 2>/dev/null || echo '?')"
 echo
