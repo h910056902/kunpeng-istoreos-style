@@ -41,7 +41,7 @@ trap 'rm -rf "$TMP"' EXIT INT TERM
 
 echo
 echo "=========================================="
-echo "  鲲鹏 C2000 U · portal 内嵌 8080 + 小字开关"
+echo "  鲲鹏 C2000 U · iStoreOS 风格门户 (v3)"
 echo "=========================================="
 echo
 
@@ -58,9 +58,9 @@ SIZE="$(wc -c < "$TMP/kp-portal.sh" | tr -d ' ')"
 [ "$SIZE" -gt 1000 ] || die "下载内容异常（$SIZE 字节），疑似被劫持/404"
 ok "kp-portal.sh 就绪（$SIZE 字节）"
 
-# ---- 拉 payload ----
+# ---- 拉 payload（v3 只需 portal.lua）----
 mkdir -p "$TMP/payload"
-for f in portal.lua quickstart-main.htm quickstart-nosmall.snippet; do
+for f in portal.lua; do
 	if get "$BASE/payload/$f" "$TMP/payload/$f"; then
 		ok "payload/$f（$(wc -c < "$TMP/payload/$f" | tr -d ' ') 字节）"
 	else

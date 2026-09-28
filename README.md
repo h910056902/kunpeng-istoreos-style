@@ -97,11 +97,18 @@ docs/
 
 MIT
 
-## 子项目：`portal-istoreos/` —— 门户弹层内嵌 8080 + 小字开关
+## 子项目：`portal-istoreos/` —— iStoreOS 风格门户（v3 四卡片）
 
-把 80 端口门户 `http://<lan>/cgi-bin/portal` 的「高级配置」弹层，
-指向 **`http://<lan>:8080/cgi-bin/luci/admin/quickstart/`**（原先是错误的 istorerouter），
-并在弹层里加一个**设备级生效**的「小字：已显示 / 已隐藏」开关（偏好存 UCI，默认显示）。
+把 80 端口门户 `http://<lan>/cgi-bin/portal` 重新规划成 **iStoreOS 风格四卡片入口**：
+
+| 卡片 | 目标 |
+|---|---|
+| istore os风格化（弹层内嵌，保留登录） | `:8080/cgi-bin/luci/admin/istorerouter` |
+| 高级设置（新标签） | `:8080/cgi-bin/luci/admin/quickstart/` |
+| 美化版界面 | `:10086/` |
+| 官方界面 | `/cgi-bin/luci` |
+
+链接全部按请求 Host 动态生成（不硬编码 IP）。
 
 **一行命令安装**（SSH 到设备，root）：
 
@@ -111,4 +118,9 @@ wget -qO /tmp/kp-portal.sh https://raw.githubusercontent.com/h910056902/kunpeng-
 
 回滚：`ROLLBACK=1 sh /tmp/kp-portal.sh`
 
-详见 [portal-istoreos/README.md](portal-istoreos/README.md)。
+详见 [portal-istoreos/README.md](portal-istoreos/README.md)；
+**8080 实例全量功能盘点**见 [docs/FEATURES-8080.md](docs/FEATURES-8080.md)。
+
+> v3 变更：删除「小字开关」与「进入 8080 界面」按钮，不再写 `/etc/config/kp_portal`；
+> 新增 `KP-ISTOREROUTER-MENU v2` / `KP-ISTOREROUTER-VIEW v1` 两个 dispatcher 标记块，
+> 修好 8080 上 `/admin/istorerouter` 的路由与渲染。

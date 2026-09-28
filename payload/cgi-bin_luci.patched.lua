@@ -28,6 +28,25 @@ function parser.parse(path, ...)
 		   name == "admin_status/nradio_8080_sysauth.htm" then
 			path = private_viewdir .. "/" .. name
 		end
+		-- KP-TTYD-VIEW-MARKER: ttyd 终端页改用实例私有视图
+		--   共享视图的运行判据（tonumber("running")=nil）与终端地址（host:8080:7681）
+		--   在 8080 独立实例下均不成立；私有视图缺失时静默回退共享视图，不会 500。
+		if name == "ttyd/overview.htm" then
+			local kp_ttyd_view = private_viewdir .. "/" .. name
+			if require("nixio.fs").access(kp_ttyd_view) then
+				path = kp_ttyd_view
+			end
+		end
+		-- KP-ISTOREROUTER-VIEW v1: 允许 iStoreRouter 的 SPA 壳走实例私有视图。
+		--   私有目录缺失时静默回退共享 /usr/lib/lua/luci/view/istorerouter/。
+		if name == "istorerouter/index.htm"
+		   or name == "istorerouter/main.htm"
+		   or name == "istorerouter/main_dev.htm" then
+			local kp_priv = private_viewdir .. "/" .. name
+			if require("nixio.fs").access(kp_priv) then
+				path = kp_priv
+			end
+		end
 	end
 	return original_parse(path, ...)
 end
@@ -178,6 +197,51 @@ function luci.dispatcher.createtree()
 				leaf = true
 			}
 		end
+
+		-- KP-ISTOREROUTER-MENU v2 BEGIN
+		-- 让 iStoreRouter 在 8080 实例可用。
+		-- 背景：共享 menu.d/luci-app-istorerouter.json 只在 80 端口那份 indexcache
+		--       里生效；8080 走自己的 /tmp/luci-indexcache-bootstrap，加上本 CGI 用
+		--       createtree() 重建了 admin 子树，导致 /admin/istorerouter 未注册
+		--       → 已登录也返回 "Not Found"。
+		-- 做法与 quickstart 一致：显式挂纯 leaf 节点，**不加带 title 的子节点**
+		--       （子节点会让 argon 侧栏把顶类目渲染成下拉分组，直接链接消失 —— v1 教训）。
+		--
+		-- ⚠⚠ v1 的坑（实测，必看）：
+		--   v1 写成 target = luci.dispatcher.template("istorerouter/main")，
+		--   **绕过了 controller 的 get_params()** → 模板里 <%=id.arch%> / <%=id.uid%> /
+		--   <%=id.version%> / <%=model%> / <%=cache_tag%> 全是 nil
+		--   → 模板第 28 行 `id.arch` 抛 "attempt to index global 'id' (a nil value)"
+		--   → dispatcher 捕获异常，但**此时 HTTP 头已发出（200）**，报错文本被当模板输出
+		--     内联进 `arch:"Status: 500 Internal Server Error..."` → window.device_id 变垃圾
+		--     → SPA 启动即崩 → 页面空白/转圈。
+		--   （外部表现为 200，看不出失败，极难排查 —— 必须登录取正文才看得到。）
+		--
+		-- v2 修法：target 改成**调用 controller 的 istorerouter_template()**，
+		--   它内部 render("istorerouter/main", get_params())，把 id/model/cache_tag
+		--   一并注入，与 80 端口官方路径完全同构。
+		--   ⚠ 不直接调 index()：index() 有 pgrep quickstart 守卫（守护没跑时会
+		--     改成 redirect_fallback 把人踢走）；istorerouter_template 无守卫。
+		if require("nixio.fs").access("/usr/lib/lua/luci/view/istorerouter/main.htm")
+		   or require("nixio.fs").access(private_viewdir .. "/istorerouter/main.htm") then
+			admin.nodes.istorerouter = {
+				nodes = {},
+				target = function()
+					local ok, ctl = pcall(require, "luci.controller.istorerouter")
+					if ok and type(ctl) == "table" and type(ctl.istorerouter_template) == "function" then
+						ctl.istorerouter_template()
+					else
+						-- 兜底：controller 不可用时退回裸渲染（会比官方少 id/model，
+						-- 但至少不会 500；正常路径永远走不到这里）。
+						luci.template.render("istorerouter/main")
+					end
+				end,
+				title = "iStoreRouter",
+				order = 3,
+				leaf = true
+			}
+		end
+		-- KP-ISTOREROUTER-MENU v2 END
 	end
 	set_bootstrap_theme(tree)
 	return tree
