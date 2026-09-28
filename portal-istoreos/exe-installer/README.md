@@ -41,6 +41,36 @@ python build_exe.py
 `build_exe.py` 会先把 `../portal-istoreos/` 下的权威源同步到 `payload/`，
 再调用 PyInstaller 打成单文件、无控制台的 exe。
 
+### ⚠️ 打包前必须确认宿主 Python 带 tkinter
+
+**托管版 Python（如 `~/.workbuddy/binaries/python/...`）通常不带 tkinter。**
+用它打包 → 打出的 exe 双击就报：
+
+```
+ModuleNotFoundError: No module named 'tkinter'
+```
+
+（本次真实踩过：13.3 MB 的包完全没打进 `tkinter` / `tk86t.dll` / `tcl86t.dll`。）
+
+`build_exe.py` 现在**预检三个模块**（tkinter / PyInstaller / paramiko），
+缺任何一个直接拒绝打包并给出提示。本机可用的打包解释器：
+
+```
+C:\Users\91005\AppData\Local\Microsoft\WindowsApps\python.exe   # 3.10.11，自带 tkinter 8.6
+```
+
+验证产物是否真的带了 GUI 运行时（**别只看"进程存活"**）：
+
+```bat
+python -c "d=open(r'dist\鲲鹏门户安装器.exe','rb').read(); print('tk86t.dll', d.count(b'tk86t.dll'), 'tcl86t.dll', d.count(b'tcl86t.dll'), 'tkinter', d.count(b'tkinter'))"
+```
+
+期望：`tk86t.dll 1  tcl86t.dll 1  tkinter 8`。全 0 就是废包。
+
+> 判据提示：**「进程存活 6 秒」不能证明 GUI 起来了** —— Tk 初始化前崩溃的进程
+> 也可能还没退出。要枚举窗口标题确认（PyInstaller onefile 的 Tk 跑在**子进程**里，
+> 按父进程 PID 枚举窗口会找不到）。
+
 ## 传输机制（为什么这么写）
 
 固件上没有 `base64` / `od` / `openssl` / `xxd`，也没有 `sftp`，所以：

@@ -45,7 +45,40 @@ def sync_payload():
                                      os.path.getsize(dst)))
 
 
+def preflight():
+    """打包前硬性检查 —— 这些缺失会打出「双击即崩」的废包。"""
+    log("预检：%s" % sys.executable)
+
+    # ★ tkinter 必须有：托管版 Python 常常不带，打出来就是 ModuleNotFoundError
+    try:
+        import tkinter
+        log("  ✓ tkinter %s (Tk %s)" % (tkinter.__file__,
+                                         getattr(tkinter, "TkVersion", "?")))
+    except ImportError:
+        raise SystemExit(
+            "\n[致命] 当前 Python 没有 tkinter，打出的 exe 双击会报 "
+            "'No module named tkinter'。\n"
+            "请改用自带 tkinter 的 Python 重新打包，例如 Windows 原生安装版：\n"
+            "    python -c \"import tkinter; print('ok')\"   # 先确认\n"
+            "    python build_exe.py\n"
+            "（本机可用：C:\\Users\\91005\\AppData\\Local\\Microsoft\\"
+            "WindowsApps\\python.exe  —— 已确认带 tkinter 8.6）\n")
+
+    try:
+        import PyInstaller
+        log("  ✓ PyInstaller %s" % PyInstaller.__version__)
+    except ImportError:
+        raise SystemExit("[致命] 缺少 PyInstaller：pip install pyinstaller")
+
+    try:
+        import paramiko
+        log("  ✓ paramiko %s" % paramiko.__version__)
+    except ImportError:
+        raise SystemExit("[致命] 缺少 paramiko：pip install paramiko")
+
+
 def main():
+    preflight()
     sync_payload()
 
     sep = ";" if os.name == "nt" else ":"
@@ -77,9 +110,19 @@ def main():
 
     final = os.path.join(HERE, "dist", EXE_CN)
     if os.path.abspath(built) != os.path.abspath(final):
+        # ⚠️ 用「改名让位」代替 os.remove —— 某些环境（沙箱/安全软件）
+        #    会把删除操作拦到回收站并失败，导致整个构建半途炸掉。
+        #    改名是纯元数据操作，不会被拦。
         if os.path.exists(final):
-            os.remove(final)
-        shutil.move(built, final)
+            stale = final + ".old"
+            if os.path.exists(stale):
+                try:
+                    os.replace(built, stale)   # 先占用 .old 名，再把旧的挤走
+                except OSError:
+                    pass
+            os.replace(final, stale)           # 旧的 → .old（不删）
+            log("旧产物已让位 → %s" % os.path.basename(stale))
+        os.replace(built, final)
 
     size = os.path.getsize(final) / 1024.0 / 1024.0
     log("✓ 产物: %s (%.1f MB)" % (final, size))

@@ -461,7 +461,59 @@ def run_cli():
     return 0 if all(o for _, o, _ in d.notes) else 1
 
 
+def _fatal_no_gui(exc):
+    """
+    GUI 起不来时的兜底 —— **绝不能静默退出**。
+    打包时若宿主 Python 没带 tkinter，PyInstaller 就不会打进去，
+    exe 双击后立刻抛 ModuleNotFoundError 然后窗口一闪而过。
+    这里把它变成一句能看懂的话：写日志 + 弹原生对话框 + 退到 CLI。
+    """
+    msg = (
+        "图形界面无法启动：%s\n\n"
+        "最常见原因：打包环境的 Python 没有 tkinter 模块。\n"
+        "解决办法：用自带 tkinter 的 Python 重新打包 ——\n"
+        "    python build_exe.py\n"
+        "（build_exe.py 会自动检查 tkinter 并拒绝在缺失时打包）\n\n"
+        "也可以改用命令行模式：\n"
+        "    set ROUTER_PW=你的密码\n"
+        "    %s --cli"
+    ) % (exc, os.path.basename(sys.executable))
+
+    # 1) 写日志文件（exe 旁边，方便排查）
+    try:
+        base = os.path.dirname(sys.executable) if getattr(sys, "frozen", False) \
+            else os.path.dirname(os.path.abspath(__file__))
+        with open(os.path.join(base, "kp_installer_error.log"), "w",
+                  encoding="utf-8") as f:
+            f.write(msg + "\n\n")
+            traceback.print_exc(file=f)
+    except Exception:
+        pass
+
+    # 2) 弹系统原生对话框（不依赖 tkinter）
+    try:
+        import ctypes
+        ctypes.windll.user32.MessageBoxW(
+            0, msg, "鲲鹏门户安装器 · 启动失败", 0x10 | 0x1000)
+    except Exception:
+        pass
+
+    # 3) 控制台也打一份
+    try:
+        print(msg, file=sys.stderr)
+    except Exception:
+        pass
+
+    return 3
+
+
 if __name__ == "__main__":
     if "--cli" in sys.argv:
         sys.exit(run_cli())
-    run_gui()
+    try:
+        run_gui()
+    except ImportError as _e:
+        # 典型：No module named 'tkinter'
+        sys.exit(_fatal_no_gui(_e))
+    except Exception as _e:
+        sys.exit(_fatal_no_gui(_e))
