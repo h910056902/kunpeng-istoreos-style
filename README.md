@@ -99,8 +99,10 @@ python scripts\kp-8080-backup.py --out D:\bak\8080 --tar
 ```
 
 抓到：8080 docroot 全量文件、`luci-static` 软链、`menu.d`、UCI 配置
-（uhttpd / istore / istorerouter / kp_portal / quickstart）、`opkg list-installed`。
-本机基准：**77 文件 / 1.3 MB**，tar.gz 约 **532 KB**，逐文件写 `MANIFEST.txt`。
+（uhttpd / istore / istorerouter / kp_portal / quickstart）、
+**用户后装插件清单**（`plugins.txt` / `plugins.names` / `plugins.feed-status.txt`）、
+**软件源配置**（`feeds/` + `feeds.txt`，含连通性快照）、`opkg list-installed`。
+本机基准：**80 文件 / 1.3 MB**，tar.gz 约 **535 KB**，逐文件写 `MANIFEST.txt`。
 
 **② 恢复（用 exe）**
 
@@ -119,6 +121,38 @@ set ROUTER_PW=你的密码
 > **77/77 文件推送成功、0 失败**；独立核对 **77/77 文件 md5 与基线逐字节一致**，
 > 17 个 KP 补丁标记、9 条软链、4 个 `menu.d` 全部回来，
 > 登录后 `istorerouter` / `quickstart` 均 200。
+
+**③ 恢复插件（`--restore-plugins`）**
+
+把备份里的用户后装包（本机 134 个：Docker 全家桶 / python3 全家桶 /
+OpenClash / 1Panel / iStore 系列 / quickstart / frpc / 51ddns / UNM …）
+按清单装回来 —— 已装的跳过、缺的 `opkg install`，失败的写
+`plugins.restore-failed.txt`：
+
+```bat
+鲲鹏门户安装器.exe --restore-plugins "D:\bak\8080"
+```
+
+> 判据是 `Installed-Time`（厂商 493 个包共用一个时间戳），**不是 opkg 的
+> `Status`** —— `install user installed` 会把 busybox/kernel/dnsmasq 这些
+> 固件包也算进去（本机实测 291 个，多 157 个不该动的）。
+>
+> **真机破坏性实测**：卸载 `zoneinfo-asia`（零反向依赖）→ 恢复 →
+> 精确识别「133 跳过 + 1 待装」→ 装回 → 包总数回到 628 ✓
+
+**④ 测试软件源（`--test-feeds`）**
+
+三层递进：每个源 HTTP 连通性 → `opkg update` 索引刷新（opkg 真正依赖的）
+→ 实际 `opkg download` 一个包验证下载链路：
+
+```bat
+鲲鹏门户安装器.exe --test-feeds
+```
+
+> 本机实测：**7/7 源 200**（aliyun openwrt_base/packages/routing +
+> istore store/nasluci/meta/compat，0.2~0.4s）、7 源索引刷新共 **5715 包**、
+> `zoneinfo-asia` 30.2 KB 下载成功 —— **全部可用**；134 个用户后装包
+> **全部在源里可装，0 缺失**。
 
 ## 运行环境
 

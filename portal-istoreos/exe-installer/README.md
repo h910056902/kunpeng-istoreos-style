@@ -25,12 +25,17 @@
 
 ```bat
 set ROUTER_PW=你的密码
-鲲鹏门户安装器.exe --cli                  :: 安装
-鲲鹏门户安装器.exe --cli --restore "D:\path\to\kp-8080-backup-live"
+鲲鹏门户安装器.exe --cli                          :: 安装
+鲲鹏门户安装器.exe --cli --restore "D:\path\kp-8080-backup-live"
+鲲鹏门户安装器.exe --restore-plugins "D:\path\kp-full-backup"
+鲲鹏门户安装器.exe --test-feeds
 ```
 
 可选环境变量：`ROUTER_HOST`（默认 `192.168.66.1`）、`ROUTER_USER`（默认 `root`）。
 退出码 `0` = 全部验收通过。
+
+> `--restore` / `--restore-plugins` / `--test-feeds` **不必再带 `--cli`**，
+> 它们本身就走无 GUI 通道。
 
 ## 它做了什么
 
@@ -59,18 +64,53 @@ set ROUTER_PW=你的密码
 实测：**77/77 文件推送成功、0 失败**；CGI md5、`main.htm` md5、19 个 KP 补丁标记、
 9 条软链、`istorerouter` 与 `quickstart` 认证后均 200 全部对得上。
 
+### 恢复插件（`--restore-plugins <dir>`）
+
+按备份里的 `plugins.names`（用户后装包清单）把插件装回来：
+
+| 步骤 | 动作 |
+|---|---|
+| 1 | `opkg update` 刷新源索引 |
+| 2 | 比对：已装的跳过、待装的列出来、源里没有的提前预警 |
+| 3 | 逐个 `opkg install`（分批，防命令超长撑爆通道），逐个报 ✓/✗ |
+| 4 | 汇总成功/失败/跳过；失败的写入 `plugins.restore-failed.txt` |
+
+- 「用户后装包」的判据是 **`Installed-Time` > 1750000000**（厂商 493 个包共用
+  `1747797524` 这一个时间戳）。**不能用 `Status`** —— `install user installed`
+  有 291 个，把 busybox/kernel/dnsmasq 这些固件包也算进去了。
+- 实测（真机）：卸掉 `zoneinfo-asia` → 恢复 → 精确识别"133 跳过 + 1 待装"，
+  装回后包总数回到 628 ✓
+- 全量基准：134 个用户后装包（Docker 全家桶 / python3 全家桶 / OpenClash /
+  1Panel / iStore 系列 / quickstart / frpc / 51ddns / UNM …），
+  **全部在源里可装**（7 源 5715 包，0 缺失）。
+
+### 测试软件源（`--test-feeds`）
+
+三层递进，逐层报结果：
+
+| 层 | 测什么 | 为什么 |
+|---|---|---|
+| ① 连通性 | curl 每个源的 `Packages.gz`（HTTP 码/大小/耗时） | 网络通不通 |
+| ② 索引 | `opkg update`，数成功刷新的源 + 索引里包总数 | **opkg 真正依赖的是这个**；HTTP 通 ≠ 索引可用 |
+| ③ 实际下载 | `opkg download` 一个小包 | 证明下载链路完整（含 https/证书/落盘） |
+
+实测（真机）：7/7 源 200（0.2~0.4s）、7 源索引刷新、5715 包、
+`zoneinfo-asia` 30.2 KB 下载成功 —— **全部可用**。
+
 ## 配套备份脚本
 
 ```bat
 :: 生成备份（默认写到 .\kp-8080-backup-live）
 python scripts\kp-8080-backup.py
 :: 或指定输出目录 / 打 tar 包
-python scripts\kp-8080-backup.py --out D:\bak\8080 --tar 1
+python scripts\kp-8080-backup.py --out D:\bak\8080 --tar
 ```
 
 备份内容：8080 docroot 全量文件、`luci-static` 软链、`menu.d`、UCI 配置
-（uhttpd / istore / istorerouter / kp_portal / quickstart）、`opkg list-installed`。
-以本机为准约 **77 文件 / 1.3 MB**，tar.gz 约 **532 KB**。
+（uhttpd / istore / istorerouter / kp_portal / quickstart）、
+**用户后装插件清单**（`plugins.txt` / `plugins.names` / `plugins.feed-status.txt`）、
+**软件源配置**（`feeds/` + `feeds.txt`，含连通性快照）、`opkg list-installed`。
+以本机为准约 **80 文件 / 1.3 MB**，tar.gz 约 **535 KB**。
 
 ## 重新构建
 
