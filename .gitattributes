@@ -5,3 +5,4 @@
 *.py text eol=lf
 *.uci text eol=lf
 *.snippet text eol=lf
+*.luci text eol=lf

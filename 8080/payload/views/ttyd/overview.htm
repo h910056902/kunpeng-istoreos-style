@@ -1,0 +1,197 @@
+<%+header%>
+<%
+-- KP-TTYD-PRIVATE-VIEW —— 8080 实例私有的终端页（覆盖共享 view/ttyd/overview.htm）
+--
+-- 一、为什么需要私有覆盖：共享视图有两处假设在「8080 独立实例」下不成立
+--   1) 运行判据写成 tonumber(luci.sys.exec("/etc/init.d/ttyd status"))。
+--      本机 rc.common 在 source 完 init 脚本【之后】才定义自己的 status()（走 _procd_status），
+--      脚本内那个 `echo 1` 是死代码，实际输出是文本 "running"；
+--      tonumber("running") = nil → 视图判断 is_running == 1 永远为假 → 假故障「ttyd is not running」。
+--   2) 终端地址拼成 window.location.host + ":" + port。本实例 location.host 已是
+--      "192.168.66.1:8080"，再拼 :7681 得到非法地址 "192.168.66.1:8080:7681"，连接必然失败。
+--
+-- 二、本模板取法
+--   - 判据与固件原生 Web SSH（controller/nradio_adv/webssh.lua）一致：ps + status 文本三重判定；
+--   - 终端改为内嵌 ttyd 自身页面（http://<host>:<port>/），iframe 文档与 ttyd 服务同源，
+--     ttyd 的 --check-origin 必然放行（实测跨端口 Origin 亦放行，同源更稳）；
+--   - 地址用 SERVER_NAME 主机名 + ttyd 端口显式拼接，不再依赖 location.host。
+--
+-- 三、⚠ 模板作用域陷阱（踩过：直接 500）
+--   LuCI 模板的 env 链是 viewns → 控制器传入的 scope，且本页由 call("overview") 渲染，
+--   scope 只有 {title, is_running}。因此 http / string / tostring / table 等全局【都不在作用域】，
+--   用了就是 "attempt to index global 'X'" → 整页 500。
+--   本模板只使用：require()（viewns 提供，共享视图已验证）+ 局部变量 + 字符串方法调用 + pcdata。
+local http = require("luci.http")
+local sys  = require("luci.sys")
+local fs   = require("nixio.fs")
+local uci  = require("luci.model.uci").cursor()
+local disp = require("luci.dispatcher")
+
+local function kp_trim(value)
+	return ((value == nil) and "" or (value .. "")):gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+-- ttyd 监听端口 / 协议：只接受 uci 里的合法端口值
+local kp_port = kp_trim(uci:get("ttyd", "default", "port"))
+if not kp_port:match("^%d+$") then kp_port = "7681" end
+local kp_scheme = (uci:get("ttyd", "default", "ssl") == "1") and "https" or "http"
+
+-- 运行判据（三重：进程 / status 文本 / status 数字，任一命中即视为运行中）
+local kp_installed = false
+local kp_status = ""
+local kp_proc = ""
+if fs.access("/usr/bin/ttyd") and fs.access("/etc/init.d/ttyd") then
+	kp_installed = true
+	kp_status = kp_trim(sys.exec("/etc/init.d/ttyd status 2>/dev/null || true"))
+	kp_proc = kp_trim(sys.exec("ps w 2>/dev/null | grep '[u]sr/bin/ttyd' || true"))
+end
+local kp_running = (kp_proc ~= "") or (kp_status == "1") or (kp_status:lower():find("running", 1, true) ~= nil)
+
+-- 终端地址主机名：优先本次请求的主机名，回落 br-lan 地址
+local kp_host = kp_trim(http.getenv("SERVER_NAME") or http.getenv("HTTP_HOST") or "")
+kp_host = kp_host:gsub(":%d+$", "")
+if kp_host == "" or kp_host == "0.0.0.0" or kp_host == "::" or kp_host == "localhost" then
+	kp_host = kp_trim(sys.exec("ip -4 addr show br-lan 2>/dev/null | awk '/inet /{print $2; exit}' | cut -d/ -f1"))
+end
+if kp_host == "" then kp_host = "192.168.66.1" end
+
+local kp_url = kp_scheme .. "://" .. kp_host .. ":" .. kp_port .. "/"
+local kp_start_url  = disp.build_url("admin", "system", "ttyd", "start")  or ""
+local kp_config_url = disp.build_url("admin", "system", "ttyd", "config") or ""
+%>
+<style type="text/css">
+	.kp-ttyd { max-width: 1180px; margin: 14px auto 26px; }
+	.kp-ttyd-head {
+		display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between;
+		gap: 10px; padding: 12px 16px; border-radius: 12px 12px 0 0;
+		border: 1px solid rgba(94,114,228,.22);
+		background: linear-gradient(135deg, rgba(94,114,228,.12), rgba(130,94,228,.03));
+	}
+	.kp-ttyd-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; min-width: 0; }
+	.kp-badge {
+		display: inline-flex; align-items: center; gap: 6px; padding: 4px 10px; border-radius: 999px;
+		font-size: 12px; font-weight: 600; border: 1px solid transparent; white-space: nowrap;
+	}
+	.kp-badge.ok { color: #0f7a3d; background: rgba(30,158,75,.12); border-color: rgba(30,158,75,.35); }
+	.kp-badge.off { color: #b03030; background: rgba(216,72,72,.12); border-color: rgba(216,72,72,.35); }
+	.kp-badge.soft {
+		color: #5a6070; background: rgba(94,114,228,.08); border-color: rgba(94,114,228,.2);
+		font-family: ui-monospace, Menlo, Consolas, monospace;
+		max-width: 100%; overflow-wrap: anywhere; white-space: normal;
+	}
+	.kp-ttyd-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+	.kp-btn {
+		display: inline-flex; align-items: center; justify-content: center; min-height: 34px;
+		padding: 7px 12px; border: 1px solid rgba(94,114,228,.28); border-radius: 8px;
+		background: #fff; color: #2b2f38; font-size: 12px; font-weight: 600; line-height: 1.2;
+		cursor: pointer; text-decoration: none;
+		transition: background-color .15s ease, transform .15s ease, box-shadow .15s ease;
+	}
+	.kp-btn:hover { background: rgba(94,114,228,.1); text-decoration: none; transform: translateY(-1px); }
+	.kp-btn-primary { background: var(--primary, #5e72e4); border-color: var(--primary, #5e72e4); color: #fff; }
+	.kp-btn-primary:hover { background: var(--primary, #5e72e4); color: #fff; box-shadow: 0 6px 16px rgba(94,114,228,.32); }
+	.kp-btn:focus, .kp-badge:focus { outline: 2px solid var(--primary, #5e72e4); outline-offset: 2px; }
+	.kp-ttyd-stage {
+		position: relative; overflow: hidden; background: #0b1220;
+		border: 1px solid rgba(94,114,228,.22); border-top: 0; border-radius: 0 0 12px 12px;
+		box-shadow: 0 10px 26px rgba(15,23,42,.14);
+	}
+	.kp-ttyd-frame { display: block; width: 100%; height: 70vh; min-height: 420px; border: 0; background: #0b1220; }
+	.kp-ttyd-stage.kp-full .kp-ttyd-frame { height: 88vh; }
+	.kp-ttyd-note { margin: 10px 2px 0; font-size: 12px; color: #6a6f75; overflow-wrap: anywhere; }
+	.kp-ttyd-empty {
+		padding: 22px 18px; border: 1px solid rgba(216,72,72,.35); border-top: 0;
+		border-radius: 0 0 12px 12px; background: rgba(216,72,72,.05);
+	}
+	.kp-ttyd-empty strong { display: block; font-size: 15px; color: #b03030; margin-bottom: 6px; }
+	.kp-ttyd-empty span { font-size: 13px; color: #6a6f75; }
+	/* 暗色（Argon mode=dark 时 <body class="dark">） */
+	body.dark .kp-ttyd-head { border-color: rgba(255,255,255,.09); background: #2b2b31; }
+	body.dark .kp-btn { background: #33333a; border-color: rgba(255,255,255,.14); color: #e6e6e8; }
+	body.dark .kp-btn:hover { background: rgba(72,61,139,.35); }
+	body.dark .kp-btn-primary { background: var(--dark-primary, #483d8b); border-color: var(--dark-primary, #483d8b); color: #fff; }
+	body.dark .kp-badge.soft { color: #b9bec7; background: rgba(255,255,255,.06); border-color: rgba(255,255,255,.12); }
+	body.dark .kp-ttyd-stage { border-color: rgba(255,255,255,.09); box-shadow: none; }
+	body.dark .kp-ttyd-note, body.dark .kp-ttyd-empty span { color: #9aa0a8; }
+	body.dark .kp-ttyd-empty { border-color: rgba(255,255,255,.12); background: rgba(255,255,255,.03); }
+	@media (max-width: 640px) {
+		.kp-ttyd-frame { height: 60vh; min-height: 320px; }
+		.kp-ttyd-head { padding: 10px 12px; }
+	}
+</style>
+
+<h2 name="content">Web SSH 终端</h2>
+
+<div class="kp-ttyd">
+	<div class="kp-ttyd-head">
+		<div class="kp-ttyd-meta">
+			<% if kp_running then %>
+			<span class="kp-badge ok">ttyd 运行中</span>
+			<% elseif kp_installed then %>
+			<span class="kp-badge off">ttyd 已停止</span>
+			<% else %>
+			<span class="kp-badge off">ttyd 未安装</span>
+			<% end %>
+			<span class="kp-badge soft"><%=pcdata(kp_url)%></span>
+		</div>
+		<div class="kp-ttyd-actions">
+			<% if kp_running then %>
+			<button type="button" class="kp-btn" onclick="return kpTtydReload();">重载终端</button>
+			<button type="button" class="kp-btn" onclick="return kpTtydFull();">全屏</button>
+			<a class="kp-btn" href="<%=pcdata(kp_url)%>" target="_blank" rel="noopener noreferrer">新标签页打开</a>
+			<% elseif kp_installed then %>
+			<a class="kp-btn kp-btn-primary" href="<%=pcdata(kp_start_url)%>">启动 ttyd</a>
+			<a class="kp-btn" href="<%=pcdata(kp_config_url)%>">终端设置</a>
+			<% else %>
+			<a class="kp-btn" href="<%=pcdata(kp_config_url)%>">终端设置</a>
+			<% end %>
+		</div>
+	</div>
+
+	<% if kp_running then %>
+	<div class="kp-ttyd-stage" id="kp-ttyd-stage">
+		<iframe id="kp-ttyd-frame" class="kp-ttyd-frame"
+			src="<%=pcdata(kp_url)%>" data-src="<%=pcdata(kp_url)%>"
+			title="ttyd Web SSH" loading="lazy"
+			allow="clipboard-read; clipboard-write" tabindex="0"></iframe>
+	</div>
+	<p class="kp-ttyd-note">终端由设备上的 ttyd 服务（端口 <%=pcdata(kp_port)%>）直接提供，与登录门户同源。若长时间空白：先点「重载终端」，再试「新标签页打开」。</p>
+	<% elseif kp_installed then %>
+	<div class="kp-ttyd-empty">
+		<strong>ttyd 未运行</strong>
+		<span>服务已安装但进程未启动。点上方「启动 ttyd」后本页会自动显示终端。</span>
+	</div>
+	<% else %>
+	<div class="kp-ttyd-empty">
+		<strong>ttyd 未安装</strong>
+		<span>设备上缺少 /usr/bin/ttyd 或 /etc/init.d/ttyd，无法提供网页终端。</span>
+	</div>
+	<% end %>
+</div>
+
+<script type="text/javascript">
+//<![CDATA[
+(function() {
+	var stage = document.getElementById('kp-ttyd-stage');
+	var frame = document.getElementById('kp-ttyd-frame');
+	var target = frame ? (frame.getAttribute('data-src') || frame.src) : '';
+
+	window.kpTtydReload = function() {
+		if (!frame || !target) { return false; }
+		frame.src = 'about:blank';
+		window.setTimeout(function() { frame.src = target; }, 80);
+		return false;
+	};
+
+	window.kpTtydFull = function() {
+		if (!stage) { return false; }
+		var isFull = stage.className.indexOf('kp-full') >= 0;
+		stage.className = isFull
+			? stage.className.replace(/\s*kp-full/, '')
+			: stage.className + ' kp-full';
+		return false;
+	};
+})();
+//]]>
+</script>
+<%+footer%>

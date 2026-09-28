@@ -1,0 +1,12 @@
+# name	target	kind	# kind=link -> symlink(name -> target)；kind=dir -> 实体目录必须是目录
+# argon 用【相对】目标（同目录 bootstrap），其余用绝对目标
+argon	bootstrap	link
+bootstrap	-	dir
+iform	/www/luci-static/iform	link
+istore	/www/luci-static/istore	link
+istorerouter	/www/luci-static/istorerouter	link
+linkeasefile	/www/luci-static/linkeasefile	link
+natpierce	/www/luci-static/natpierce	link
+nradio	/www/luci-static/nradio	link
+quickstart	/www/luci-static/quickstart	link
+resources	/www/luci-static/resources	link

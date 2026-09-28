@@ -1,0 +1,216 @@
+<%#
+ NRadio SMS page for the isolated LuCI instance on port 8080.
+ 数据源：ubus smsd list（收件箱），ubus atsdcpe at_cmd（发送 AT+CMG*）
+ 写操作 POST 到本页 ?action=sms_send
+-%>
+<%
+	local sys = require "luci.sys"
+	local util = require "luci.util"
+	local jsonc = require "luci.jsonc"
+	local http = require "luci.http"
+	local dispatcher = require "luci.dispatcher"
+
+	local NET = "cpe"
+
+	local function trim(v)
+		return (tostring(v or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+	end
+
+	local function ubus(obj, method, args)
+		local cmd = "ubus call " .. obj .. " " .. method
+		if args then cmd = cmd .. " '" .. args .. "'" end
+		local raw = sys.exec(cmd .. " 2>/dev/null") or ""
+		local ok, data = pcall(jsonc.parse, raw)
+		if ok and type(data) == "table" then return data end
+		return nil
+	end
+
+	-- 短信数据
+	local sms = ubus("smsd", "list") or {}
+	local list = type(sms.smslist) == "table" and sms.smslist or {}
+	local ready = tonumber(sms.ready) or 0
+	local used = tonumber(sms.used) or 0
+	local total = tonumber(sms.total) or 0
+
+	local msgs = {}
+	for _, m in ipairs(list) do
+		if type(m) == "table" then
+			msgs[#msgs + 1] = {
+				index  = trim(m.index or m.id or ""),
+				number = trim(m.number or m.phone or m.originating or ""),
+				text   = trim(m.text or m.content or m.body or ""),
+				time   = trim(m.time or m.date or m.timestamp or ""),
+				unread = (tostring(m.read or m.unread or "0") == "0"),
+			}
+		end
+	end
+
+	local flash = http.formvalue("kpc_msg") or ""
+-%>
+<%+header%>
+
+<style type="text/css">
+.kpc-cell { margin-bottom: 18px; }
+.kpc-grid {
+	display: grid; gap: 10px;
+	grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+}
+.kpc-item {
+	border: 1px solid rgba(0,0,0,.09);
+	border-radius: 10px; padding: 9px 12px;
+	background: rgba(0,0,0,.015);
+}
+.kpc-item > span { display: block; font-size: 12px; opacity: .68; margin-bottom: 3px; }
+.kpc-item > strong { font-size: 15px; font-weight: 600; }
+.kpc-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.kpc-table th, .kpc-table td { padding: 6px 9px; text-align: left; border-bottom: 1px solid rgba(0,0,0,.07); vertical-align: top; }
+.kpc-table th { font-weight: 600; font-size: 12px; opacity: .72; }
+.kpc-table tr:last-child td { border-bottom: 0; }
+.kpc-sms-text { white-space: pre-wrap; word-break: break-word; max-width: 520px; }
+.kpc-pill {
+	display: inline-block; padding: 1px 8px; border-radius: 9px;
+	font-size: 12px; line-height: 18px;
+	background: rgba(94,114,228,.13); color: var(--primary, #5e72e4);
+}
+.kpc-pill.kpc-on { background: rgba(34,160,107,.15); color: #1d8a5b; }
+.kpc-pill.kpc-off { background: rgba(0,0,0,.07); opacity: .7; }
+.kpc-hint { font-size: 12px; opacity: .65; margin: 6px 0 0; }
+.kpc-nowarn { font-size: 12px; opacity: .7; }
+.kpc-form-row { display: flex; gap: 14px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
+.kpc-msg {
+	padding: 9px 13px; border-radius: 9px; margin-bottom: 14px; font-size: 13px;
+	background: rgba(34,160,107,.12); border: 1px solid rgba(34,160,107,.28);
+}
+.kpc-msg.kpc-msg-ok { background: rgba(34,160,107,.12); border-color: rgba(34,160,107,.28); }
+.kpc-msg.kpc-msg-err { background: rgba(214,69,69,.1); border-color: rgba(214,69,69,.3); }
+.kpc-msg.kpc-msg-warn { background: rgba(216,160,26,.12); border-color: rgba(216,160,26,.3); }
+.message { margin-bottom: 0; }
+textarea.kpc-sms-input { width: 100%; max-width: 560px; min-height: 92px; font-family: inherit; font-size: 13px; }
+
+/* ---- 深色适配：见 kpc-cellular.htm 顶部说明（主题走 prefers-color-scheme） ---- */
+@media (prefers-color-scheme: dark) {
+	.kpc-item { border-color: rgba(255,255,255,.12); background: rgba(255,255,255,.035); }
+	.kpc-table th, .kpc-table td { border-bottom-color: rgba(255,255,255,.09); }
+	.kpc-pill { background: rgba(94,114,228,.22); }
+	.kpc-pill.kpc-off { background: rgba(255,255,255,.09); }
+	.kpc-msg { background: rgba(34,160,107,.18); border-color: rgba(34,160,107,.4); }
+	.kpc-msg.kpc-msg-ok { background: rgba(34,160,107,.18); border-color: rgba(34,160,107,.4); }
+	.kpc-msg.kpc-msg-err { background: rgba(214,69,69,.18); border-color: rgba(214,69,69,.45); }
+	.kpc-msg.kpc-msg-warn { background: rgba(216,160,26,.18); border-color: rgba(216,160,26,.45); }
+}
+body.dark .kpc-item { border-color: rgba(255,255,255,.12); background: rgba(255,255,255,.035); }
+body.dark .kpc-table th, body.dark .kpc-table td { border-bottom-color: rgba(255,255,255,.09); }
+body.dark .kpc-pill { background: rgba(94,114,228,.22); }
+body.dark .kpc-pill.kpc-off { background: rgba(255,255,255,.09); }
+body.dark .kpc-msg { background: rgba(34,160,107,.18); border-color: rgba(34,160,107,.4); }
+body.dark .kpc-msg.kpc-msg-ok { background: rgba(34,160,107,.18); border-color: rgba(34,160,107,.4); }
+body.dark .kpc-msg.kpc-msg-err { background: rgba(214,69,69,.18); border-color: rgba(214,69,69,.45); }
+body.dark .kpc-msg.kpc-msg-warn { background: rgba(216,160,26,.18); border-color: rgba(216,160,26,.45); }
+</style>
+
+<h2 name="content">短信</h2>
+
+<% if flash ~= "" then %>
+<div class="kpc-msg <%= (flash:sub(1, 1) == "!") and "kpc-msg-err" or "" %>"><%=pcdata(flash:gsub("^!", ""))%></div>
+<% end %>
+
+<!-- ====================== 存储概览 ====================== -->
+<div class="kpc-cell">
+	<div class="kpc-grid">
+		<div class="kpc-item"><span>模块短信就绪</span><strong><%= (ready == 1) and "是" or "否" %></strong></div>
+		<div class="kpc-item"><span>已用 / 容量</span><strong><%=used%> / <%=total%></strong></div>
+		<div class="kpc-item"><span>当前卡槽</span><strong><%=pcdata(NET)%></strong></div>
+	</div>
+	<% if ready ~= 1 then %>
+	<p class="kpc-hint">模块短信功能当前未就绪 —— 通常表示 SIM 卡未注册上网、或该卡槽无卡。发送可能失败。</p>
+	<% end %>
+</div>
+
+<!-- ====================== 发送 ====================== -->
+<fieldset class="cbi-section">
+	<h3>发送短信</h3>
+	<form id="kpc-sms-form" method="post" action="<%=pcdata(dispatcher.build_url("admin", "status", "sms"))%>">
+		<input type="hidden" name="action" value="sms_send" />
+		<div class="kpc-form-row">
+			<label style="white-space:nowrap">收件号码
+				<input type="text" name="sms_number" value="" placeholder="如 10086 或 +8613800138000"
+					style="width:220px" pattern="[+0-9]{3,20}" required />
+			</label>
+		</div>
+		<div class="kpc-form-row" style="display:block">
+			<div style="margin-bottom:4px">短信内容</div>
+			<textarea class="kpc-sms-input" name="sms_text" maxlength="480"
+				placeholder="最多 480 个字符（约 3 条短信）" required></textarea>
+		</div>
+		<div class="kpc-form-row">
+			<button class="cbi-button cbi-button-apply" type="submit" id="kpc-sms-btn">发送</button>
+			<span class="kpc-nowarn">发送经由模块 AT 通道，通常 3–8 秒完成。</span>
+		</div>
+	</form>
+	<div id="kpc-sms-msg" class="kpc-msg" style="display:none"></div>
+</fieldset>
+
+<script type="text/javascript">
+(function () {
+	var form = document.getElementById('kpc-sms-form');
+	if (!form) return;
+	var btn = document.getElementById('kpc-sms-btn');
+	var box = document.getElementById('kpc-sms-msg');
+	var url = '<%=pcdata(dispatcher.build_url("admin", "status", "sms"))%>';
+
+	function say(ok, text) {
+		box.style.display = '';
+		box.className = 'kpc-msg ' + (ok ? 'kpc-msg-ok' : 'kpc-msg-err');
+		box.textContent = text;
+	}
+
+	form.addEventListener('submit', function (ev) {
+		ev.preventDefault();
+		var num = form.sms_number.value.trim();
+		var txt = form.sms_text.value;
+		if (!/^\+?[0-9]{3,20}$/.test(num)) { say(false, '收件号码格式不正确'); return; }
+		if (!txt) { say(false, '短信内容不能为空'); return; }
+		if (!window.confirm('确认向 ' + num + ' 发送该短信？\n\n内容：' + txt.slice(0, 60) + (txt.length > 60 ? '…' : ''))) return;
+
+		btn.disabled = true;
+		say(true, '正在提交…');
+		fetch(url + '?action=sms_send', {
+			method: 'POST',
+			credentials: 'same-origin',
+			headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+			body: 'action=sms_send&sms_number=' + encodeURIComponent(num) +
+			      '&sms_text=' + encodeURIComponent(txt)
+		}).then(function (r) { return r.json(); }).then(function (d) {
+			say(d.code === 0, (d.code === 0 ? '✓ ' : '✗ ') + (d.msg || '未知结果'));
+			if (d.code === 0) form.sms_text.value = '';
+		}).catch(function (e) {
+			say(false, '请求失败：' + e);
+		}).then(function () {
+			btn.disabled = false;
+		});
+	});
+})();
+</script>
+
+<!-- ====================== 收件箱 ====================== -->
+<fieldset class="cbi-section">
+	<h3>收件箱（<%=#msgs%> 条）</h3>
+	<% if #msgs == 0 then %>
+	<p class="kpc-hint">暂无短信。模块短信存储为空，或尚未读取。</p>
+	<% else %>
+	<table class="kpc-table">
+		<tr><th style="width:52px">#</th><th style="width:140px">号码</th><th style="width:150px">时间</th><th>内容</th><th style="width:64px">状态</th></tr>
+		<% for _, m in ipairs(msgs) do %>
+		<tr>
+			<td><%=pcdata(m.index ~= "" and m.index or "-")%></td>
+			<td><%=pcdata(m.number ~= "" and m.number or "-")%></td>
+			<td><%=pcdata(m.time ~= "" and m.time or "-")%></td>
+			<td class="kpc-sms-text"><%=pcdata(m.text ~= "" and m.text or "-")%></td>
+			<td><span class="kpc-pill <%= m.unread and "kpc-on" or "kpc-off" %>"><%= m.unread and "未读" or "已读" %></span></td>
+		</tr>
+		<% end %>
+	</table>
+	<% end %>
+</fieldset>
+
+<%+footer%>

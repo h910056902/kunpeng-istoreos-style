@@ -1,0 +1,1467 @@
+#!/usr/bin/lua
+
+if os.getenv("SERVER_PORT") ~= "8080" then
+	io.write("Status: 404 Not Found\r\nContent-Type: text/plain\r\n\r\nNot Found\n")
+	return
+end
+
+local script_filename = os.getenv("SCRIPT_FILENAME") or (arg and arg[0]) or ""
+local instance_root = script_filename:match("^(.*)/www/cgi%-bin/luci$")
+if not instance_root or instance_root == "" then
+	io.write("Status: 500 Internal Server Error\r\nContent-Type: text/plain\r\n\r\nInvalid CGI path\n")
+	return
+end
+local private_viewdir = instance_root .. "/usr/lib/lua/luci/view"
+
+require "luci.cacheloader"
+require "luci.sgi.cgi"
+
+local template = require "luci.template"
+local parser = require "luci.template.parser"
+local original_parse = parser.parse
+local shared_view_prefix = template.viewdir .. "/"
+function parser.parse(path, ...)
+	if path:sub(1, #shared_view_prefix) == shared_view_prefix then
+		local name = path:sub(#shared_view_prefix + 1)
+		-- KP-QUICKSTART-VIEW v2: overlay-with-fallback
+		-- private dir exists -> private; else keep shared (official) path.
+		-- So official view upgrades are followed automatically by removing
+		-- the same-named private file (prevents stale private view shadowing
+		-- the official new one -> white screen).
+		local kp_whitelist = name:match("^themes/bootstrap/")
+			or name == "admin_status/nradio_details.htm"
+			or name == "admin_status/nradio_cellular.htm"
+			or name == "admin_status/nradio_device.htm"
+			or name == "admin_status/nradio_sms.htm"
+			or name == "admin_status/nradio_8080_sysauth.htm"
+			or name == "quickstart/main.htm"
+			or name == "quickstart/home.htm"
+			or name == "quickstart/wizard.htm"
+			-- KP-ISTOREROUTER-VIEW v1: 允许 iStoreRouter 的 SPA 壳走实例私有视图；
+			-- 私有目录没有同名文件时静默回退共享视图（overlay-with-fallback 语义）。
+			-- 注：v2 后渲染改走 controller 的 istorerouter_template()，
+			-- 该白名单仍然有用（私有视图若存在则优先，否则回落共享）。
+			or name == "istorerouter/index.htm"
+			or name == "istorerouter/main.htm"
+			or name == "istorerouter/main_dev.htm"
+		if kp_whitelist then
+			local kp_priv = private_viewdir .. "/" .. name
+			if require("nixio.fs").access(kp_priv) then
+				path = kp_priv
+			end
+		end
+		-- KP-TTYD-VIEW-MARKER-BEGIN
+		-- ttyd 终端页改用实例私有视图：共享视图的运行判据（tonumber("running")=nil）
+		-- 与终端地址（host:8080:7681）在 8080 独立实例下均不成立。
+		-- 私有视图缺失时静默回退共享视图，不会 500。
+		if name == "ttyd/overview.htm" then
+			local kp_ttyd_view = private_viewdir .. "/" .. name
+			if require("nixio.fs").access(kp_ttyd_view) then
+				path = kp_ttyd_view
+			end
+		end
+		-- KP-TTYD-VIEW-MARKER-END
+	end
+	return original_parse(path, ...)
+end
+
+local luci_util = require "luci.util"
+if type(luci_util.shellquote) ~= "function" then
+	function luci_util.shellquote(value)
+		return "'" .. tostring(value or ""):gsub("'", "'\\''") .. "'"
+	end
+end
+
+local original_httpdispatch = luci.dispatcher.httpdispatch
+local original_createtree = luci.dispatcher.createtree
+
+-- The stock system form writes the shared luci.main.mediaurlbase setting.
+-- Disable that field only in this CGI, including crafted form submissions.
+local cbi = require "luci.cbi"
+local original_cbi_load = cbi.load
+function cbi.load(model, ...)
+	local maps = original_cbi_load(model, ...)
+	if model == "admin_system/system" then
+		for _, map in ipairs(maps) do
+			for _, section in ipairs(map.children or {}) do
+				local field = section.fields and section.fields._mediaurlbase
+				if field then
+					field.parse = function() end
+					field.render = function() end
+				end
+			end
+		end
+	end
+	return maps
+end
+
+local function route_node(tree, path)
+	local node = tree
+	for _, name in ipairs(path) do
+		node = type(node) == "table" and node.nodes and node.nodes[name]
+		if type(node) ~= "table" then return nil end
+	end
+	return node
+end
+
+local function route_exists(tree, path)
+	local node = route_node(tree, path)
+	return node ~= nil and node.target ~= nil and not node.hidden
+end
+
+local function add_admin_alias(tree, menu, name, title, order, path)
+	if not route_exists(tree, path) then
+		return
+	end
+	menu.nodes[name] = {
+		nodes = {},
+		target = luci.dispatcher.alias(unpack(path)),
+		title = title,
+		order = order,
+		leaf = true
+	}
+end
+
+local function inject_plugin_menu(tree, admin)
+	local native, factory, known = {}, {}, {}
+	local menu = { nodes = {}, target = luci.dispatcher.firstchild(), title = "插件", order = 55 }
+	for _, group in ipairs({ "services", "vpn" }) do
+		local parent = route_node(tree, { "admin", group })
+		for name, child in pairs(parent and parent.nodes or {}) do
+			if type(child) == "table" and child.target and child.title and not child.hidden then
+				local path = { "admin", group, name }
+				local title = tostring(child.title)
+				native[#native + 1] = { title = title, path = path }
+				known[name:lower()] = true
+				add_admin_alias(tree, menu, group .. "_" .. name, title, tonumber(child.order) or 100, path)
+			end
+		end
+	end
+	for _, item in ipairs({
+		{ "ttyd", "Web SSH", { "admin", "system", "ttyd" } },
+		{ "docker", "Docker", { "admin", "docker" } }
+	}) do
+		if not known[item[1]] and route_exists(tree, item[3]) then
+			native[#native + 1] = { title = item[2], path = item[3] }
+			known[item[1]] = true
+			add_admin_alias(tree, menu, item[1], item[2], 200, item[3])
+		end
+	end
+	for _, item in ipairs({
+		{ "openvpn", "OpenVPN", { "nradioadv", "system", "openvpnfull" } },
+		{ "zerotier", "ZeroTier", { "nradioadv", "system", "zerotier" } },
+		{ "openlist", "OpenList", { "nradioadv", "system", "openlist" } },
+		{ "mosdns", "MosDNS", { "nradioadv", "system", "mosdns" } },
+		{ "ddns-go", "DDNS-GO", { "nradioadv", "system", "ddnsgo" } },
+		{ "docker", "Docker", { "nradioadv", "system", "docker" } },
+		{ "ttyd", "Web SSH", { "nradioadv", "system", "webssh" } },
+		{ "qiyou", "奇游联机宝", { "nradioadv", "system", "qiyou" } },
+		{ "leigod", "雷神加速器", { "nradioadv", "system", "leigod" } },
+		{ "aibot", "AI 助手", { "nradioadv", "system", "aibot" } },
+		{ "fanctrl", "风扇控制", { "nradioadv", "system", "fanctrl" } },
+		{ "cpeopt", "5G 连接监听", { "nradioadv", "cellular", "cpeopt" } }
+	}) do
+		if not known[item[1]] and route_exists(tree, item[3]) then
+			factory[#factory + 1] = { title = item[2], path = "/cgi-bin/luci/" .. table.concat(item[3], "/") }
+		end
+	end
+	table.sort(native, function(a, b) return a.title < b.title end)
+	luci.dispatcher.context.nradio_8080_links = { native = native, factory = factory }
+	if #native + #factory > 0 then
+		menu.nodes.overview = {
+			nodes = {}, title = "全部插件入口", order = 0, leaf = true,
+			target = function()
+				require("luci.http").redirect(luci.dispatcher.build_url("admin", "status", "details") .. "#nradio-plugin-links")
+			end
+		}
+		admin.nodes.nradio_plugins = menu
+	end
+end
+
+local function set_bootstrap_theme(node)
+	node.mediaurlbase = "/luci-static/bootstrap"
+	for _, child in pairs(node.nodes or {}) do
+		if type(child) == "table" then set_bootstrap_theme(child) end
+	end
+end
+
+function luci.dispatcher.createtree()
+	local tree = original_createtree()
+	local admin = tree.nodes and tree.nodes.admin
+	if admin then
+		admin.nodes = admin.nodes or {}
+		inject_plugin_menu(tree, admin)
+		tree.nodes.nradio = nil
+		tree.nodes.nradioadv = nil
+		tree.nodes.authcheck = nil
+		admin.nodes = admin.nodes or {}
+		admin.sysauth_template = "admin_status/nradio_8080_sysauth"
+		local status = admin.nodes.status
+		if not status then
+			status = { nodes = {}, target = luci.dispatcher.firstchild(), title = "状态", order = 10 }
+			admin.nodes.status = status
+		end
+		if status then
+			status.nodes = status.nodes or {}
+			status.nodes.details = {
+				nodes = {},
+				target = luci.dispatcher.template("admin_status/nradio_details"),
+				title = "设备总览",
+				order = 0,
+				leaf = true
+			}
+			-- KP-CELLULAR-MENU-BEGIN
+			status.nodes.cellular = {
+				nodes = {},
+				target = luci.dispatcher.template("admin_status/nradio_cellular"),
+				title = "蜂窝状态",
+				order = 10,
+				leaf = true
+			}
+			status.nodes.device = {
+				nodes = {},
+				target = luci.dispatcher.template("admin_status/nradio_device"),
+				title = "设备状态",
+				order = 20,
+				leaf = true
+			}
+			status.nodes.sms = {
+				nodes = {},
+				target = luci.dispatcher.template("admin_status/nradio_sms"),
+				title = "短信",
+				order = 30,
+				leaf = true
+			}
+			-- KP-CELLULAR-MENU-END
+		end
+		-- KP-QUICKSTART-MENU-BEGIN
+		-- 首页 / 网络设置向导：两个独立纯 leaf 菜单项（v2，2026-09-27）。
+		-- ⚠⚠ quickstart/network_guide 都**不能挂带 title 的子节点**：
+		--   argon 侧栏对有子节点的顶类目渲染成下拉分组，「首页」的直接链接
+		--   就消失了（v1 教训，用户实测反馈）。深链接由 wizard.htm 的
+		--   history.replaceState 预写 URL 实现，无需任何子节点。
+		admin.nodes.quickstart = {
+			nodes = {},
+			target = luci.dispatcher.template("quickstart/home"),
+			title = "首页",
+			order = 1,
+			leaf = true
+		}
+		admin.nodes.network_guide = {
+			nodes = {
+				-- 隐藏分发节点：仅供刷新/深链接 /admin/network_guide/network(/pppoe|/dhcp|/gateway)
+				-- 返回同一个 SPA 壳页。无 title + hidden=true → dispatcher.node_visible()==false
+				-- → 不进侧栏、不触发 argon 顶菜单的下拉分组渲染（v1 教训，勿加 title）。
+				network = {
+					hidden = true,
+					nodes = {
+						pppoe = { hidden = true, nodes = {}, target = luci.dispatcher.template("quickstart/wizard"), leaf = true },
+						dhcp = { hidden = true, nodes = {}, target = luci.dispatcher.template("quickstart/wizard"), leaf = true },
+						gateway = { hidden = true, nodes = {}, target = luci.dispatcher.template("quickstart/wizard"), leaf = true }
+					},
+					target = luci.dispatcher.template("quickstart/wizard"),
+					leaf = true
+				}
+			},
+			target = luci.dispatcher.template("quickstart/wizard"),
+			title = "网络设置向导",
+			order = 2,
+			leaf = true
+		}
+		-- KP-QUICKSTART-MENU-END
+		-- KP-ISTOREROUTER-MENU v2 BEGIN
+		-- 让 iStoreRouter 在 8080 实例可用（2026-09-27）。
+		-- 背景：共享 menu.d/luci-app-istorerouter.json 只在 80 端口那份
+		--       indexcache 里生效；8080 走自己的 /tmp/luci-indexcache-bootstrap，
+		--       加上本 CGI 用 createtree() 重建了 admin 子树，
+		--       导致 /admin/istorerouter 未注册 → 已登录也返回 "Not Found"。
+		-- 做法与 quickstart 保持一致：显式挂纯 leaf 节点，**不加带 title 的子节点**
+		-- （子节点会让 argon 侧栏把顶类目渲染成下拉分组，直接链接消失 —— v1 教训）。
+		--
+		-- ⚠⚠ v1 的坑（2026-09-27 实测，必看）：
+		--   v1 写成 target = luci.dispatcher.template("istorerouter/main")，
+		--   **绕过了 controller 的 get_params()** → 模板里的 <%=id.arch%> /
+		--   <%=id.uid%> / <%=id.version%> / <%=model%> / <%=cache_tag%> 全是 nil
+		--   → 模板第 28 行 `id.arch` 抛 "attempt to index global 'id' (a nil value)"
+		--   → dispatcher.lua:581 捕获异常，但**此时 HTTP 头已发出（200）**，
+		--     报错文本被当模板输出内联进 `arch:"Status: 500 Internal Server Error..."`，
+		--     整个 window.device_id 变成垃圾 → SPA 启动即崩 → 页面空白/转圈。
+		--   （外部表现为 200，看不出失败，极难排查 —— 必须登录取正文才看得到。）
+		--
+		-- v2 修法：target 改成**调用 controller 的 istorerouter_template()**，
+		--   它内部 render("istorerouter/main", get_params())，把 id/model/cache_tag
+		--   一并注入，与 80 端口官方路径完全同构。
+		--   ⚠ 不直接调 index()：index() 有 pgrep quickstart 守卫（守护没跑时会
+		--     改成 redirect_fallback 把人踢走）；istorerouter_template 无守卫。
+		--   controller 在共享 Lua 路径上（80 端口已加载它），8080 同样可见。
+		-- 该 view 已列入 KP-QUICKSTART-VIEW 白名单，才会从实例私有目录取；
+		-- 私有目录缺失时自动回退共享 /usr/lib/lua/luci/view/istorerouter/。
+		if require("nixio.fs").access("/usr/lib/lua/luci/view/istorerouter/main.htm")
+		   or require("nixio.fs").access(private_viewdir .. "/istorerouter/main.htm") then
+			admin.nodes.istorerouter = {
+				nodes = {},
+				target = function()
+					local ok, ctl = pcall(require, "luci.controller.istorerouter")
+					if ok and type(ctl) == "table" and type(ctl.istorerouter_template) == "function" then
+						ctl.istorerouter_template()
+					else
+						-- 兜底：controller 不可用时退回裸渲染（会比官方少 id/model，
+						-- 但至少不会 500；正常路径永远走不到这里）。
+						luci.template.render("istorerouter/main")
+					end
+				end,
+				title = "iStoreRouter",
+				order = 3,
+				leaf = true
+			}
+		end
+		-- KP-ISTOREROUTER-MENU v2 END
+		-- KP-NAS-PARENT-CGI v1 BEGIN
+		-- 修复 admin/nas 整树 HTTP 500 (Access Violation: no parent node)：
+		-- 厂商 controller/quickstart.lua 只注册了叶子 admin/nas/raid|smart，
+		-- 父节点 admin/nas 由 _create_node() 自动创建而带 auto=true，
+		-- dispatcher.lua:400 assert(not dependent or not auto) 因此失败。
+		-- 这里显式清 auto 并补 target，等价于官方 node("admin","nas")。
+		do
+			local nas = admin.nodes and admin.nodes.nas
+			if type(nas) == "table" then
+				nas.auto = nil
+				nas.dependent = false
+				nas.title = nas.title or "NAS"
+				nas.order = nas.order or 9
+				if nas.target == nil then
+					nas.target = luci.dispatcher.firstchild()
+				end
+			end
+		end
+		-- KP-NAS-PARENT-CGI v1 END
+	end
+	set_bootstrap_theme(tree)
+	return tree
+end
+
+function luci.dispatcher.httpdispatch(request, prefix)
+	local config = require "luci.config"
+	config.main.mediaurlbase = "/luci-static/bootstrap"
+	config.themes = { Bootstrap = "/luci-static/bootstrap" }
+	return original_httpdispatch(request, prefix)
+end
+
+local path_info = os.getenv("PATH_INFO") or ""
+local request_method = os.getenv("REQUEST_METHOD") or ""
+
+if request_method == "GET" and (
+	path_info == "" or
+	path_info == "/" or
+	path_info == "/admin" or
+	path_info == "/admin/" or
+	path_info == "/nradio" or
+	path_info:match("^/nradio/") or
+	path_info == "/nradioadv" or
+	path_info:match("^/nradioadv/")
+) then
+	io.write("Status: 302 Found\r\n")
+	io.write("Location: /cgi-bin/luci/admin/status/details\r\n")
+	io.write("Content-Type: text/plain\r\n\r\n")
+	return
+end
+
+-- KP-SERVICES-MARKER v1 (kunpeng-istoreos-style) —— 服务入口侧栏菜单
+-- 插入位置：CGI 包装器 `luci.dispatcher.indexcache = ...` 之前
+-- 语义：在包装器自己的 createtree 之上再包一层，追加「服务」菜单（鲲鹏商店 / 1Panel / Docker）
+-- 1Panel 地址：直接解析 /usr/local/bin/1pctl 的 ORIGINAL_PORT/ORIGINAL_ENTRANCE 常量，
+--              不依赖执行 bash 脚本（CGI 环境下 1pctl 可能不可用）
+do
+	local _kp_prev_createtree = luci.dispatcher.createtree
+	function luci.dispatcher.createtree()
+		local tree = _kp_prev_createtree()
+		local admin = tree.nodes and tree.nodes.admin
+		if admin then
+			admin.nodes = admin.nodes or {}
+			local http = require "luci.http"
+			local function kp_host()
+				local name = tostring(http.getenv("SERVER_NAME") or ""):gsub(":%d+$", "")
+				if name == "" then
+					name = tostring(luci.sys.exec("ip -4 addr show br-lan | grep -m1 -oE 'inet [0-9.]+' | awk '{print $2}'") or "")
+					name = name:gsub("%s+", "")
+				end
+				return name
+			end
+			local function kp_panel_base()
+				local port, ent = "10090", ""
+				local f = io.open("/usr/local/bin/1pctl", "r")
+				if f then
+					local txt = f:read("*a") or ""
+					f:close()
+					port = txt:match("ORIGINAL_PORT=(%d+)") or port
+					ent = txt:match("ORIGINAL_ENTRANCE=([%w%-_]+)") or ""
+				end
+				local base = "http://" .. kp_host() .. ":" .. port
+				if ent ~= "" then base = base .. "/" .. ent end
+				return base
+			end
+			local svc = {
+				nodes = {}, target = luci.dispatcher.firstchild(), title = "服务", order = 50
+			}
+			svc.nodes.kp_store = {
+				nodes = {}, title = "鲲鹏商店", order = 1, leaf = true,
+				target = function()
+					http.redirect("http://" .. kp_host() .. "/cgi-bin/luci/nradioadv/system/appcenter")
+				end
+			}
+			svc.nodes.kp_1panel = {
+				nodes = {}, title = "1Panel 面板", order = 2, leaf = true,
+				target = function()
+					http.redirect(kp_panel_base())
+				end
+			}
+			svc.nodes.kp_docker = {
+				nodes = {}, title = "Docker 容器", order = 3, leaf = true,
+				target = function()
+					http.redirect(kp_panel_base() .. "/containers")
+				end
+			}
+			admin.nodes.kp_services = svc
+		end
+		return tree
+	end
+end
+
+-- KP-PROCESSES-MARKER v1 —— 系统进程页空白修复（仅 8080 实例）
+-- 根因：本固件 busybox v1.33.2 的 `top -bn1` 列序与 LuCI 期望不符
+--       （实际 PID PPID USER STAT VSZ %VSZ CPU %CPU COMMAND，
+--        且 %VSZ>100 时会和 VSZ 粘连成 "1639m163.9"），
+--       而 luci.sys.process.list()（sys.lua:527）按老 busybox 列序
+--       PID PPID USER STAT VSZ %MEM% %CPU% COMMAND 写正则 →
+--       实测 176 行进程一行都匹配不到 → 进程页永远只有表头。
+-- 处置：把 process.list 换成读取 /usr/bin/top（KP-TOP-SHIM，输出兼容列序）。
+--       仅覆盖本 CGI 进程内的 luci.sys.process.list，不改任何系统文件、
+--       不影响 80 端口原生界面。
+-- 回滚：删除本 do...end 块即可（进程页回到"只有表头"的原状）。
+do
+	local kp_sys = require "luci.sys"
+	local kp_util = require "luci.util"
+	local kp_shim = "/usr/bin/top"
+
+	-- 垫片存在时才覆盖，缺失则保留原实现（安全降级）
+	local kp_f = io.open(kp_shim, "r")
+	if kp_f then
+		kp_f:close()
+		function kp_sys.process.list()
+			local data = {}
+			local ps = kp_util.execi(kp_shim .. " -bn1")
+			if not ps then return data end
+			for line in ps do
+				local pid, ppid, user, stat, vsz, mem, cpu, cmd = line:match(
+					"^ *(%d+) +(%d+) +(%S.-%S) +([RSDZTW][W ][<N ]) +(%d+) +(%d+%%) +(%d+%%) +(.+)")
+				local idx = tonumber(pid)
+				if idx then
+					data[idx] = {
+						['PID']     = pid,
+						['PPID']    = ppid,
+						['USER']    = user,
+						['STAT']    = stat,
+						['VSZ']     = vsz,
+						['%MEM']    = mem,
+						['%CPU']    = cpu,
+						['COMMAND'] = cmd
+					}
+				end
+			end
+			return data
+		end
+	end
+end
+
+-- KP-CELLULAR-ENDPOINT v1 START ============================================
+-- 8080 独立 LuCI 实例的蜂窝写操作 / 邻区扫描 / 短信发送端点。
+--
+-- 为什么塞在 cgi-bin/luci 里：本实例**没有 controller 目录**，
+--   只有 3 个 view 目录（admin_status / themes / ttyd），
+--   加控制器会牵扯 route 注册与 indexcache，风险远大于收益。
+--
+-- ⚠️ 为什么不 hook luci.dispatcher.httpdispatch：
+--   luci.sgi.cgi.run() 把 httpdispatch 放进 **coroutine** 里跑
+--   （cgi.lua:54 `coroutine.create(luci.dispatcher.httpdispatch)`），
+--   输出全靠 coroutine 的 yield 协议（id=1/2/3/4/5/6）交回主循环。
+--   我们在包装函数里直接 return 而不 yield，主循环拿不到数据 → 客户端收到空响应/回落到页面。
+--   → 因此本端点**不走 dispatcher**，而是在 CGI 文件主体、`luci.sgi.cgi.run()` 之前
+--     直接解析请求并 `io.write` 原始 HTTP 响应（等价于 cgi.lua:243 那个 302 早退块的做法）。
+--
+-- 鉴权：复用 LuCI 自身的 sysauth cookie，自行核对 ubus session（username=root）。
+--
+-- 安全：所有写操作都做「参数白名单 + 范围校验」，只触碰 cpecfg 一个 uci 文件。
+--
+-- 回滚：删除本块即可（无其它残留）。
+do
+	local function kp_trim(v)
+		return (tostring(v or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+	end
+
+	local function kp_urldec(v)
+		return (tostring(v or ""):gsub("+", " "):gsub("%%(%x%x)", function(h)
+			return string.char(tonumber(h, 16))
+		end))
+	end
+
+	-- 解析 query string → table，重复键自动收成数组
+	local function kp_parse_qs(qs)
+		local out = {}
+		for k, v in tostring(qs or ""):gmatch("([%w_%.%-]+)=([^&]*)") do
+			local dec = kp_urldec(v)
+			if out[k] == nil then
+				out[k] = dec
+			elseif type(out[k]) == "table" then
+				out[k][#out[k] + 1] = dec
+			else
+				out[k] = { out[k], dec }
+			end
+		end
+		return out
+	end
+
+	-- 解析 application/x-www-form-urlencoded body → table（重复键收成数组）
+	local function kp_parse_body(env)
+		local ct = env.CONTENT_TYPE or ""
+		if not ct:find("application/x%-www%-form%-urlencoded") then return {} end
+		local len = tonumber(env.CONTENT_LENGTH) or 0
+		if len <= 0 or len > 1024 * 64 then return {} end
+		local body = io.read("*a") or ""
+		local out = {}
+		for k, v in body:gmatch("([%w_%.%-]+)=([^&]*)") do
+			local dec = kp_urldec(v)
+			if out[k] == nil then
+				out[k] = dec
+			elseif type(out[k]) == "table" then
+				out[k][#out[k] + 1] = dec
+			else
+				out[k] = { out[k], dec }
+			end
+		end
+		return out
+	end
+
+	-- 输出 JSON（直接写 HTTP 响应，不经 dispatcher）
+	local function kp_write_json(tbl)
+		local jsonc = require "luci.jsonc"
+		local ok, body = pcall(function() return jsonc.stringify(tbl) end)
+		if not ok or type(body) ~= "string" then
+			body = '{"code":1,"msg":"json encode failed"}'
+		end
+		io.write("Status: 200 OK\r\n")
+		io.write("Content-Type: application/json; charset=utf-8\r\n")
+		io.write("Cache-Control: no-store\r\n")
+		io.write("Content-Length: " .. #body .. "\r\n\r\n")
+		io.write(body)
+		io.flush()
+	end
+
+	-- 把「连续多个 JSON 对象」的串切成对象数组。
+	-- ⚠️ 不能用 jsonc.parse 的返回值取「已消费长度」——luci.jsonc.parse 只返回 1 个值。
+	--    这里逐字符扫描，跟踪花括号深度 + 字符串/转义状态，切出每个顶层对象。
+	local function kp_split_json_objs(s)
+		local out, depth, in_str, esc, start = {}, 0, false, false, nil
+		for i = 1, #s do
+			local c = s:sub(i, i)
+			if in_str then
+				if esc then esc = false
+				elseif c == "\\" then esc = true
+				elseif c == '"' then in_str = false end
+			elseif c == '"' then
+				in_str = true
+				if not start then start = i end
+			elseif c == "{" then
+				if depth == 0 then start = i end
+				depth = depth + 1
+			elseif c == "}" then
+				depth = depth - 1
+				if depth == 0 and start then
+					out[#out + 1] = s:sub(start, i)
+					start = nil
+				end
+			end
+		end
+		return out
+	end
+
+	-- 校验 sysauth 是否为有效 root 会话
+	local function kp_check_auth()
+		local cookie = os.getenv("HTTP_COOKIE") or ""
+		-- sysauth 后面可能不是纯 hex（部分主题会带后缀），放宽到 [^;]+ 再截取
+		local tok = cookie:match("sysauth=([0-9a-fA-F]+)")
+		if not tok or #tok < 16 then return false end
+		local sys = require "luci.sys"
+		local raw = sys.exec("ubus call session list 2>/dev/null") or ""
+		if raw == "" then return false end
+		local jsonc = require "luci.jsonc"
+		for _, chunk in ipairs(kp_split_json_objs(raw)) do
+			local ok, obj = pcall(jsonc.parse, chunk)
+			if ok and type(obj) == "table" then
+				local sid = tostring(obj.ubus_rpc_session or "")
+				if sid == tok then
+					local data = obj.data or {}
+					-- 实测字段名是 data.user（不是 username），两者都认
+					local user = tostring(data.user or data.username or "")
+					if user == "root" then return true end
+				end
+			end
+		end
+		return false
+	end
+
+	-- shell 单引号安全转义（经典 '"'"' 技巧）。
+	-- 为什么必须转义：AT 写命令形如
+	--     AT^NRFREQLOCK=3,1,2,"78,41"
+	-- 里面的双引号如果直接拼进 shell 命令，会被 shell 当成引号定界符吃掉，
+	-- 结果 ubus 收到畸形 JSON，返回体里连 code 字段都没有（表现为 code=nil）。
+	-- 实测对照：
+	--     带引号  AT^NRFREQLOCK=3,1,2,"78,41"   → OK，回读 3/1,2/78/41 锁定生效
+	--     无引号  AT^NRFREQLOCK=3,1,2,78,41    → +CME ERROR: 50，锁定失败
+	-- 所以必须保留引号，且必须让引号安全穿过 shell。
+	local function kp_shq(s)
+		return "'" .. tostring(s):gsub("'", "'\\''") .. "'"
+	end
+
+	-- 发 AT 命令（经 ubus）
+	local function kp_at(iface, cmd, wait)
+		local sys = require "luci.sys"
+		local jsonc = require "luci.jsonc"
+		-- JSON 层转义：\ → \\ ，" → \"
+		local jcmd = tostring(cmd):gsub("\\", "\\\\"):gsub('"', '\\"')
+		local payload = string.format(
+			'{"cmd":"%s","wait":%d,"at_log_level":0,"block":1}',
+			jcmd, wait or 1000)
+		local raw = sys.exec(string.format(
+			"ubus call %s at_cmd %s 2>/dev/null", iface, kp_shq(payload))) or ""
+		local ok, data = pcall(jsonc.parse, raw)
+		if ok and type(data) == "table" then return data end
+		return nil
+	end
+
+	local function kp_at_text(res)
+		if type(res) ~= "table" then return "" end
+		return tostring(res.respone or "")
+	end
+
+	-- 解析 ^NRFREQLOCK? / ^LTEFREQLOCK? 回读
+	-- 真实响应：AT^NRFREQLOCK?\r\r\n^NRFREQLOCK: 3\r\n0,7\r\n78\r\n41\r\n...\r\nOK\r\n
+	-- 注意开头有 AT 回显行，且第 2 行是 <mobility>,<count>
+	local function kp_parse_lock(res, key)
+		local txt = kp_at_text(res)
+		if txt == "" then return nil end
+		local lines = {}
+		for line in txt:gmatch("[^\r\n]+") do
+			line = kp_trim(line)
+			if line ~= "" and not line:match("^AT") and line ~= "OK" then
+				lines[#lines + 1] = line
+			end
+		end
+		local t, mobility, bands = nil, "0", {}
+		for i, line in ipairs(lines) do
+			local n = line:match("^%^" .. key .. ":%s*(%d+)")
+			if n then
+				t = n
+				local nxt = lines[i + 1]
+				if nxt then
+					local m = nxt:match("^(%d+)%s*,")
+					if m then mobility = m end
+				end
+			elseif t and t ~= "0" then
+				local b = line:match("^(%d+)$")
+				if b then bands[#bands + 1] = b end
+			end
+		end
+		if not t then return nil end
+		if t == "0" then return { type = "0", mobility = "0", bands = {} } end
+		return { type = t, mobility = mobility, bands = bands }
+	end
+
+	-- 邻区扫描
+	local function kp_do_neighbor()
+		local iface = "atsdcpe"
+		local res = kp_at(iface, "AT^MONNC", 1500)
+		if type(res) ~= "table" or tostring(res.code) ~= "0" then
+			return false, "模块未响应（可能该卡槽无卡或未注册）"
+		end
+		local txt = kp_at_text(res)
+		local cells = {}
+		for line in txt:gmatch("[^\r\n]+") do
+			local mode, arfcn, pci, rsrp, rsrq, sinr =
+				line:match("^%s*%^MONNC:%s*([A-Za-z0-9]+),([^,]*),([^,]*),([^,]*),([^,]*),([^,]*)")
+			if mode then
+				local pci_dec = nil
+				local n = tonumber(pci, 16)
+				if n then pci_dec = n end
+				local r = tonumber(rsrp)
+				local pct = 0
+				if r then
+					pct = math.floor((r + 140) * 100 / 60)
+					if pct < 5 then pct = 5 end
+					if pct > 100 then pct = 100 end
+				end
+				-- 与设备原生 command_huawei_neighbour 一致：RSRP < -120 视为无效
+				if r and r >= -120 then
+					cells[#cells + 1] = {
+						mode = mode, earfcn = arfcn,
+						pci = pci_dec and tostring(pci_dec) or tostring(pci),
+						rsrp = rsrp, rsrq = rsrq, sinr = sinr, pct = pct,
+					}
+				end
+			end
+		end
+		local sys = require "luci.sys"
+		local ts = kp_trim(sys.exec("date '+%H:%M:%S' 2>/dev/null"))
+		return true, { cells = cells, time = ts }
+	end
+
+	-- 锁频：应用 / 解除
+	local function kp_do_lock(form)
+		local sys = require "luci.sys"
+		local action = kp_trim(form.action)
+		local mode = kp_trim(form.lock_mode)
+		local mobility = (kp_trim(form.lock_mobility) == "1") and "1" or "0"
+
+		local function band_list(name, max_band)
+			local out, seen = {}, {}
+			local raw = form[name]
+			local vals = {}
+			if type(raw) == "table" then vals = raw
+			elseif type(raw) == "string" and raw ~= "" then vals = { raw } end
+			for _, v in ipairs(vals) do
+				local n = tonumber(v)
+				if n and n >= 1 and n <= max_band and not seen[n] then
+					seen[n] = true; out[#out + 1] = tostring(n)
+				end
+			end
+			return out
+		end
+
+		local cmds, summary = {}, {}
+
+		if action == "lock_clear" then
+			cmds[#cmds + 1] = { "AT+CFUN=0", 1500 }
+			cmds[#cmds + 1] = { "AT^NRFREQLOCK=0", 1500 }
+			cmds[#cmds + 1] = { "AT^LTEFREQLOCK=0", 1500 }
+			cmds[#cmds + 1] = { "AT+CFUN=1", 2500 }
+			summary[#summary + 1] = "已下发解除锁定"
+		elseif mode == "band" then
+			local b5 = band_list("band5", 512)
+			local b4 = band_list("band4", 512)
+			if #b5 == 0 and #b4 == 0 then
+				return false, "没有勾选任何频段；如需解除锁定请点「解除锁定」"
+			end
+			cmds[#cmds + 1] = { "AT+CFUN=0", 1500 }
+			if #b5 > 0 then
+				table.sort(b5, function(a, b) return tonumber(a) > tonumber(b) end)
+				cmds[#cmds + 1] = { string.format('AT^NRFREQLOCK=3,%s,%d,"%s"',
+					mobility, #b5, table.concat(b5, ",")), 2500 }
+				summary[#summary + 1] = "5G 频段 " .. table.concat(b5, "/")
+			else
+				cmds[#cmds + 1] = { "AT^NRFREQLOCK=0", 1500 }
+			end
+			if #b4 > 0 then
+				table.sort(b4, function(a, b) return tonumber(a) > tonumber(b) end)
+				cmds[#cmds + 1] = { string.format('AT^LTEFREQLOCK=3,%s,%d,"%s"',
+					mobility, #b4, table.concat(b4, ",")), 2500 }
+				summary[#summary + 1] = "4G 频段 " .. table.concat(b4, "/")
+			else
+				cmds[#cmds + 1] = { "AT^LTEFREQLOCK=0", 1500 }
+			end
+			cmds[#cmds + 1] = { "AT+CFUN=1", 2500 }
+		elseif mode == "cell" then
+			local a5 = tonumber(kp_trim(form.earfcn5))
+			local p5 = tonumber(kp_trim(form.pci5))
+			local a4 = tonumber(kp_trim(form.earfcn4))
+			local p4 = tonumber(kp_trim(form.pci4))
+			if a5 and (a5 < 0 or a5 > 875000) then return false, "5G 频点超出范围（0–875000）" end
+			if p5 and (p5 < 0 or p5 > 1007) then return false, "5G PCI 超出范围（0–1007）" end
+			if a4 and (a4 < 0 or a4 > 875000) then return false, "4G 频点超出范围（0–875000）" end
+			if p4 and (p4 < 0 or p4 > 503) then return false, "4G PCI 超出范围（0–503）" end
+			if not a5 and not a4 then return false, "按小区锁定时至少需要填写一个制式的频点" end
+
+			cmds[#cmds + 1] = { "AT+CFUN=0", 1500 }
+			if a5 then
+				-- TD Tech 按频点锁定：type=2,<mobility>,1,"<arfcn>"
+				cmds[#cmds + 1] = { string.format('AT^NRFREQLOCK=2,%s,1,"%d"', mobility, a5), 2500 }
+				summary[#summary + 1] = string.format("5G ARFCN %d%s", a5, p5 and (" PCI " .. p5) or "")
+			else
+				cmds[#cmds + 1] = { "AT^NRFREQLOCK=0", 1500 }
+			end
+			if a4 then
+				cmds[#cmds + 1] = { string.format('AT^LTEFREQLOCK=2,%s,1,"%d"', mobility, a4), 2500 }
+				summary[#summary + 1] = string.format("4G ARFCN %d%s", a4, p4 and (" PCI " .. p4) or "")
+			else
+				cmds[#cmds + 1] = { "AT^LTEFREQLOCK=0", 1500 }
+			end
+			cmds[#cmds + 1] = { "AT+CFUN=1", 2500 }
+		else
+			return false, "未识别的锁定模式"
+		end
+
+		local detail = {}
+		for _, c in ipairs(cmds) do
+			local res = kp_at("atsdcpe", c[1], c[2])
+			local txt = kp_at_text(res)
+			local state
+			if txt:find("+CME ERROR", 1, true) or txt:find("ERROR", 1, true) then
+				state = kp_trim(txt:match("([%+%w%s:]*ERROR[^\r\n]*)")) or "ERROR"
+			elseif txt:find("OK", 1, true) then
+				state = "OK"
+			elseif type(res) == "table" then
+				state = "code=" .. tostring(res.code)
+			else
+				state = "无响应"
+			end
+			detail[#detail + 1] = c[1] .. " → " .. state
+		end
+
+		-- 同步 uci cpecfg，保持与系统设置一致
+		local sim = kp_trim(sys.exec("uci -q get cpesel.sim.cur 2>/dev/null"))
+		if sim == "" then sim = "1" end
+		if action == "lock_clear" then
+			sys.exec("uci -q set cpecfg.cpesim" .. sim .. ".custom_freq=0")
+			sys.exec("uci -q set cpecfg.cpesim" .. sim .. ".custom_earfcn5=0")
+			sys.exec("uci -q set cpecfg.cpesim" .. sim .. ".custom_earfcn4=0")
+			sys.exec("uci -q delete cpecfg.cpesim" .. sim .. ".freq")
+			sys.exec("uci -q delete cpecfg.cpesim" .. sim .. ".earfcn5")
+			sys.exec("uci -q delete cpecfg.cpesim" .. sim .. ".earfcn4")
+			sys.exec("uci -q commit cpecfg")
+		end
+
+		return true, table.concat(summary, "；"), table.concat(detail, " | ")
+	end
+
+	-- 短信发送
+	local function kp_do_sms(form)
+		local num = kp_trim(form.sms_number):gsub("[%s%-]", "")
+		local text = tostring(form.sms_text or "")
+		if not num:match("^%+?%d+$") then return false, "收件号码格式不正确" end
+		if #num < 3 or #num > 20 then return false, "收件号码长度不正确" end
+		if #text == 0 then return false, "短信内容不能为空" end
+		if #text > 480 then return false, "短信内容超过 480 字符" end
+		-- 去掉控制字符，避免注入 AT 命令
+		local safe = text:gsub("[%z\1-\8\11\12\14-\31\r\n]", " ")
+		if safe:sub(-1) == "\26" then safe = safe:sub(1, -2) end
+
+		kp_at("atsdcpe", "AT+CMGF=1", 1200)
+		kp_at("atsdcpe", 'AT+CMGS="' .. num .. '"', 900)
+		local res = kp_at("atsdcpe", safe .. "\26", 6000)
+		local txt = kp_at_text(res)
+		if txt:find("ERROR", 1, true) then
+			return false, "模块返回错误：" .. kp_trim(txt:gsub("[\r\n]+", " "))
+		end
+		return true, "已提交发送（" .. #text .. " 字符）"
+	end
+
+	-- ---- 请求分发 ----
+	local function kp_try_handle()
+		local path_info = os.getenv("PATH_INFO") or ""
+		local qs = os.getenv("QUERY_STRING") or ""
+		local q = kp_parse_qs(qs)
+		local action = kp_trim(q.action)
+		if action == "" then return false end
+
+		local kind = nil
+		if path_info:match("^/admin/status/cellular/?$") then kind = "cellular"
+		elseif path_info:match("^/admin/status/sms/?$") then kind = "sms" end
+		if not kind then return false end
+
+		local actions = kind == "cellular"
+			and { neighbor = true, lock_apply = true, lock_clear = true }
+			or  { sms_send = true }
+		if not actions[action] then return false end
+
+		-- 鉴权（必须在任何输出之前）
+		if not kp_check_auth() then
+			kp_write_json({ code = 1, msg = "会话已过期，请重新登录" })
+			return true
+		end
+
+		local env = {
+			CONTENT_TYPE = os.getenv("CONTENT_TYPE") or "",
+			CONTENT_LENGTH = os.getenv("CONTENT_LENGTH") or "",
+			REQUEST_METHOD = os.getenv("REQUEST_METHOD") or "",
+		}
+		local form = kp_parse_body(env)
+		-- body 优先，missing 的键用 query 补
+		for k, v in pairs(q) do
+			if form[k] == nil then form[k] = v end
+		end
+		form.action = action
+
+		if action == "neighbor" then
+			local ok, data = kp_do_neighbor()
+			if ok then data.code = 0; data.msg = ""
+				kp_write_json(data)
+			else
+				kp_write_json({ code = 1, msg = data })
+			end
+			return true
+		end
+
+		if action == "lock_apply" or action == "lock_clear" then
+			local ok, msg, detail = kp_do_lock(form)
+			local sys = require "luci.sys"
+			sys.exec("sleep 1")
+			local state = {
+				lock5 = kp_parse_lock(kp_at("atsdcpe", "AT^NRFREQLOCK?", 1200), "NRFREQLOCK"),
+				lock4 = kp_parse_lock(kp_at("atsdcpe", "AT^LTEFREQLOCK?", 1200), "LTEFREQLOCK"),
+				trace = detail,
+			}
+			kp_write_json({ code = ok and 0 or 1, msg = msg, state = state })
+			return true
+		end
+
+		if action == "sms_send" then
+			local ok, msg = kp_do_sms(form)
+			kp_write_json({ code = ok and 0 or 1, msg = msg })
+			return true
+		end
+
+		return false
+	end
+
+	-- 在 run() 之前就地处理（输出走 io.write，与 cgi.lua 的早退块同款）
+	if kp_try_handle() then
+		return
+	end
+end
+-- KP-CELLULAR-ENDPOINT v1 END ==============================================
+
+
+-- KP-QUICKSTART-PATCH v2 START ==========================================
+-- PATCH-BUILD: p10-20260927
+-- 补齐 quickstart 首页两个卡片被 Go `,omitempty` 抹掉的字段。
+-- （2026-09-27 实证：后端硬编码查 network.interface.wan，但 C2000 的真实
+--   上行是蜂窝 cpe(device eth3)；wan(eth0) 被禁用 → 零值 → 字段被省略 →
+--   前端 NaN KB/s / IPv4 "-" / DNS 空。）
+--
+-- 本块只在 8080 反代层生效，全部 pcall 包裹；任何失败都回落「原样透传」。
+-- ⚠ 必须定义成**全局函数**：挂接点在 KP-QUICKSTART-PROXY 的 do..end 作用域内，
+--   块内 local 函数在那里不可见（实测踩坑）。
+kp_qs_patch_read_file = function(p)
+		local f = io.open(p, "r")
+		if not f then return nil end
+		local v = f:read("*a")
+		f:close()
+		if type(v) ~= "string" then return nil end
+		return (v:gsub("%s+$", ""))
+	end
+
+	-- P10 / P2-2: 统一「空值」判定：nil 或 空串 都算缺失。
+	kp_qs_blank = function(v)
+		return v == nil or v == ""
+	end
+
+	-- 取"承载 IPv4 的真实上行接口名"：在候选里挑第一个 ipv4-address 非空的。
+	kp_qs_patch_pick_iface = function(js, names)
+		for _, nm in ipairs(names) do
+			local s = nil
+			local okn = pcall(function()
+				s = require("luci.sys").exec("ubus call network.interface." .. nm .. " status")
+			end)
+			if okn and type(s) == "string" and #s > 0 then
+				local o = nil
+				pcall(function() o = js.parse(s) end)
+				if type(o) == "table" then
+					local a = o["ipv4-address"]
+					if type(a) == "table" and type(a[1]) == "table"
+					   and type(a[1].address) == "string" and a[1].address ~= "" then
+						return nm, o
+					end
+				end
+			end
+		end
+		return nil, nil
+	end
+
+	kp_qs_patch_pick_iface6 = function(js, names)
+		for _, nm in ipairs(names) do
+			local s = nil
+			local okn = pcall(function()
+				s = require("luci.sys").exec("ubus call network.interface." .. nm .. " status")
+			end)
+			if okn and type(s) == "string" and #s > 0 then
+				local o = nil
+				pcall(function() o = js.parse(s) end)
+				if type(o) == "table" then
+					local a = o["ipv6-address"]
+					if type(a) == "table" and type(a[1]) == "table"
+					   and type(a[1].address) == "string" and a[1].address ~= "" then
+						return nm, o
+					end
+				end
+			end
+		end
+		return nil, nil
+	end
+
+	-- P10 / P3-4: 真实上行 device 名（用于读 /sys/class/net/<dev>/statistics/*）
+	-- 改用 luci.jsonc.parse 解析 ubus JSON（实测可用）；l3_device 优先、device 兜底。
+	-- 实测接口差异：cpe 无 device key(proto=wwan)；cpe_4/cpe_6 有 l3_device+device；
+	--              wan 无 l3_device(device=eth0)。
+	kp_qs_patch_uplink_device = function()
+		local okjs, jsp = pcall(require, "luci.jsonc")
+		local names = { "cpe_4", "cpe_6", "cpe", "wan" }
+		for _, nm in ipairs(names) do
+			local s = nil
+			local okn = pcall(function()
+				s = require("luci.sys").exec("ubus call network.interface." .. nm .. " status")
+			end)
+			if okn and type(s) == "string" and #s > 0 then
+				local d = nil
+				if okjs and type(jsp) == "table" and type(jsp.parse) == "function" then
+					local o = nil
+					pcall(function() o = jsp.parse(s) end)
+					if type(o) == "table" then
+						d = o.l3_device
+						if d == nil or d == "" then d = o.device end
+					end
+				end
+				if d == nil or d == "" then
+					d = s:match('"l3_device"%s*:%s*"([^"]+)"')
+						or s:match('"device"%s*:%s*"([^"]+)"')
+				end
+				if type(d) == "string" and d ~= "" then
+					if kp_qs_patch_read_file("/sys/class/net/" .. d .. "/statistics/rx_bytes") then
+						return d
+					end
+				end
+			end
+		end
+		return "eth0"
+	end
+
+	-- JSON 值转义（只处理字符串里可能出现的字符）
+	kp_qs_patch_jesc = function(s)
+		s = tostring(s)
+		s = s:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r')
+		return s
+	end
+
+	-- 收集设备真实网络信息（供两处共用）
+	kp_qs_patch_real_net = function(js)
+		local info = {}
+		local nm4, o4 = kp_qs_patch_pick_iface(js, { "cpe_4", "cpe", "wan", "lan" })
+		if o4 then
+			local a = o4["ipv4-address"]
+			if type(a) == "table" and type(a[1]) == "table" then
+				info.ipv4addr = a[1].address
+				if a[1].mask then info.ipv4mask = tostring(a[1].mask) end
+			end
+			if type(o4.proto) == "string" then info.proto = o4.proto end
+			local dn = o4["dns-server"]
+			if type(dn) == "table" and #dn > 0 then
+				local L = {}
+				for _, d in ipairs(dn) do
+					if type(d) == "string" and d ~= "" then L[#L + 1] = d end
+				end
+				if #L > 0 then info.dnsList = L end
+			end
+			-- gateway：优先 route 里的 default，其次 inactive.route 的 nexthop
+			local rt = o4.route
+			if type(rt) == "table" then
+				for _, r in ipairs(rt) do
+					if type(r) == "table" and tostring(r.target) == "0.0.0.0"
+					   and type(r.nexthop) == "string" then
+						info.gateway = r.nexthop
+						break
+					end
+				end
+			end
+			if not info.gateway then
+				local ir = o4.inactive and o4.inactive.route
+				if type(ir) == "table" then
+					for _, r in ipairs(ir) do
+						if type(r) == "table" and type(r.nexthop) == "string" then
+							info.gateway = r.nexthop
+							break
+						end
+					end
+				end
+			end
+			if nm4 then info.iface4 = nm4 end
+		end
+		local nm6, o6 = kp_qs_patch_pick_iface6(js, { "cpe_6", "cpe_4", "cpe", "wan" })
+		if o6 then
+			local a = o6["ipv6-address"]
+			if type(a) == "table" and type(a[1]) == "table"
+			   and type(a[1].address) == "string" then
+				info.ipv6addr = a[1].address
+			end
+		end
+		info.dev = kp_qs_patch_uplink_device()
+		info.disp = "cpe"
+		return info
+	end
+
+	-- ---- (A) /u/network/status/ 响应补齐 ----
+	kp_qs_patch_status = function(js, rbody)
+		local o = nil
+		pcall(function() o = js.parse(rbody) end)
+		if type(o) ~= "table" then return rbody end
+		local res = o.result
+		if type(res) ~= "table" then return rbody end
+
+		local n = kp_qs_patch_real_net(js)
+		-- P10 / P2-2: Lua 里 not "" == false（空串是 truthy），后端若返回空串，
+		-- 旧的 `if not res.ipv4addr` 会判 false → 静默跳过补齐。改用 kp_qs_blank。
+		if kp_qs_blank(res.ipv4addr) and not kp_qs_blank(n.ipv4addr) then
+			res.ipv4addr = n.ipv4addr
+			res.ipv4mask = n.ipv4mask or res.ipv4mask
+			res.proto = n.proto or res.proto
+			res.gateway = n.gateway or res.gateway
+			if res.defaultInterface == nil or res.defaultInterface == "wan" then
+				res.defaultInterface = n.iface4 or n.disp
+			end
+		end
+		if kp_qs_blank(res.ipv6addr) and not kp_qs_blank(n.ipv6addr) then res.ipv6addr = n.ipv6addr end
+		if kp_qs_blank(res.proto)    and not kp_qs_blank(n.proto)    then res.proto    = n.proto    end
+		if kp_qs_blank(res.gateway)  and not kp_qs_blank(n.gateway)  then res.gateway  = n.gateway  end
+		if res.dnsList == nil or res.dnsList == js.null then
+			if n.dnsList then res.dnsList = n.dnsList end
+		end
+		if res.dnsProto == nil or res.dnsProto == "" then
+			res.dnsProto = "auto"
+		end
+
+		local ok_enc, s2 = pcall(function() return js.stringify(o) end)
+		if ok_enc and type(s2) == "string" and #s2 > 0 then return s2 end
+		return rbody
+	end
+
+	-- ---- (B) /u/network/statistics/ 响应补齐 ----
+	kp_qs_patch_statistics = function(js, rbody)
+		local o = nil
+		pcall(function() o = js.parse(rbody) end)
+		if type(o) ~= "table" then return rbody end
+		local res = o.result
+		if type(res) ~= "table" then return rbody end
+		local items = res.items
+		if type(items) ~= "table" or #items == 0 then return rbody end
+
+		local dev = kp_qs_patch_uplink_device()
+		local function rd(k)
+			local v = kp_qs_patch_read_file("/sys/class/net/" .. dev .. "/statistics/" .. k)
+			return tonumber(v)
+		end
+		-- P10 / P2-1: 采样窗口从 0.3s 降到 0.15s（降低每请求阻塞），
+		-- 并统一用 WIN 变量，保证「睡眠时长」与「速率分母」一致。
+		local WIN = 0.15
+		local rx1, tx1 = rd("rx_bytes"), rd("tx_bytes")
+		local slept = false
+		pcall(function()
+			local nx = require("nixio")
+			if type(nx.nanosleep) == "function" then
+				nx.nanosleep(0, 150000000)
+				slept = true
+			end
+		end)
+		if not slept then
+			-- 兜底（仅 nixio 缺失时）：忙等 WIN 秒
+			local t0 = os.clock()
+			while os.clock() - t0 < WIN do end
+		end
+		local rx2, tx2 = rd("rx_bytes"), rd("tx_bytes")
+
+		local ds, us = 0, 0
+		if rx1 and rx2 and rx2 >= rx1 then ds = math.floor((rx2 - rx1) / WIN) end
+		if tx1 and tx2 and tx2 >= tx1 then us = math.floor((tx2 - tx1) / WIN) end
+		if ds < 0 then ds = 0 end
+		if us < 0 then us = 0 end
+
+		for i = 1, #items do
+			if type(items[i]) ~= "table" then items[i] = {} end
+			if items[i].downloadSpeed == nil then items[i].downloadSpeed = 0 end
+			if items[i].uploadSpeed == nil then items[i].uploadSpeed = 0 end
+		end
+		local last = items[#items]
+		last.downloadSpeed = ds
+		last.uploadSpeed = us
+
+		local ok_enc, s2 = pcall(function() return js.stringify(o) end)
+		if ok_enc and type(s2) == "string" and #s2 > 0 then return s2 end
+		return rbody
+	end
+
+	-- 挂接点：由 kp_qs_proxy() 调用（返回改写后的 body）
+	kp_qs_patch_dispatch = function(pi, rbody)
+		local okjs, js = pcall(require, "luci.jsonc")
+		if not okjs or type(js) ~= "table" or type(js.parse) ~= "function" then
+			return rbody
+		end
+		local out = rbody
+		pcall(function()
+			if pi:match("/u/network/status/$") then
+				out = kp_qs_patch_status(js, rbody)
+			elseif pi:match("/u/network/statistics/$") then
+				out = kp_qs_patch_statistics(js, rbody)
+			end
+		end)
+		return out
+	end
+-- KP-QUICKSTART-PATCH v2 END ============================================
+
+-- KP-QUICKSTART-PROXY v2 START ===========================================
+-- 8080 实例**没有 lua_prefix**（/etc/config/uhttpd 的 openwrt8080 段无该项，
+-- 只有 80 端 main 有），所以 /cgi-bin/luci 是普通 CGI，无法注册 SGI handler。
+-- 因此在 CGI 主体、run() 之前拦 PATH_INFO 以 /istore 开头的请求，反代到
+-- quickstart 守护进程 127.0.0.1:3038（语义对齐官方 istore_backend.lua）。
+--
+-- ⚠ 两个实测坑（2026-09-27，勿推翻）：
+--   1) uhttpd 的 cgi_prefix=/cgi-bin，**会把 SCRIPT 名剥掉**：
+--      请求 /cgi-bin/luci/istore/u/x  →  PATH_INFO = /istore/u/x
+--      （不是 /cgi-bin/luci/istore/u/x）
+--      而 3038 的 Go 路由**挂在全前缀下**：带 /cgi-bin/luci 前缀才 200，
+--      不带则 404。→ 转发时**必须把 /cgi-bin/luci 拼回**。
+--   2) 3038 靠 X-Forwarded-Token 鉴权：
+--        无 token            → {"success":-1001}
+--        带 token（任意非空） → 真实数据（version/网络状态等）
+--      所以必须从 sysauth cookie 取 sid 同时塞进 X-Forwarded-Sid 和
+--      X-Forwarded-Token。
+--   3) nixio.socket() 返回的是 **userdata**（不是 table），守卫不能写
+--      type(s)=="table"，否则直接判定失败。
+do
+	local function kp_qs_proxy()
+		-- 仅本实例（8080）生效
+		if (os.getenv("SERVER_PORT") or "") ~= "8080" then return false end
+		-- ⚠ PATH_INFO 已被 uhttpd 剥掉 /cgi-bin/luci，这里只匹配 /istore
+		local pi = os.getenv("PATH_INFO") or ""
+		if not pi:match("^/istore") then return false end
+
+		local function out(status, ctype, body)
+			io.write("Status: " .. status .. "\r\n")
+			io.write("Content-Type: " .. ctype .. "\r\n")
+			io.write("Cache-Control: no-store\r\n")
+			io.write("Content-Length: " .. #body .. "\r\n\r\n")
+			io.write(body)
+			io.flush()
+		end
+
+		local ok_nixio, nixio = pcall(require, "nixio")
+		if not ok_nixio or type(nixio) ~= "table" or type(nixio.socket) ~= "function" then
+			out("502 Bad Gateway", "application/json; charset=utf-8",
+			    '{"code":1,"msg":"nixio unavailable"}')
+			return true
+		end
+
+		local ok_sock, sock = pcall(nixio.socket, "inet", "stream")
+		-- nixio.socket() 返回 userdata，不能断言 table
+		if not ok_sock or sock == nil then
+			out("502 Bad Gateway", "application/json; charset=utf-8",
+			    '{"code":1,"msg":"socket() failed"}')
+			return true
+		end
+
+		-- ⚠ 实测本机 nixio socket 对象**无 settimeout 方法**，
+		--   必须守卫后再调，否则 pcall 里报错会污染后续 connect。
+		pcall(function()
+			if type(sock.settimeout) == "function" then
+				sock:settimeout(8)
+			elseif type(sock.setblocking) == "function" then
+				sock:setblocking(true)
+			end
+		end)
+
+		local ok_conn, connected = pcall(function()
+			return sock:connect("127.0.0.1", 3038)
+		end)
+		if not ok_conn or not connected then
+			pcall(function() sock:close() end)
+			out("502 Bad Gateway", "application/json; charset=utf-8",
+			    '{"code":1,"msg":"quickstart backend unreachable on 127.0.0.1:3038"}')
+			return true
+		end
+
+		local method = os.getenv("REQUEST_METHOD") or "GET"
+		local qs = os.getenv("QUERY_STRING") or ""
+		-- ⚠ 关键：把 /cgi-bin/luci 前缀**拼回**（3038 的路由挂在全前缀下）
+		local target = "/cgi-bin/luci" .. pi
+		if qs ~= "" then target = target .. "?" .. qs end
+
+		local body = ""
+		local clen = tonumber(os.getenv("CONTENT_LENGTH") or "0") or 0
+		if clen > 0 and clen <= 1048576 then
+			local ok_r, b = pcall(function() return io.read(clen) end)
+			if ok_r and type(b) == "string" then body = b end
+		end
+
+		local cookie = os.getenv("HTTP_COOKIE") or ""
+		local sid = cookie:match("sysauth=([0-9a-fA-F]+)") or ""
+		-- 3038 用 X-Forwarded-Token 鉴权（实测非空即可拿到真实数据）
+		local hdrs = {
+			method .. " " .. target .. " HTTP/1.1",
+			"Host: 127.0.0.1:3038",
+			"X-Forwarded-Sid: " .. sid,
+			"X-Forwarded-Token: " .. sid,
+			"X-Forwarded-For: " .. (os.getenv("REMOTE_ADDR") or ""),
+			"Content-Type: " .. (os.getenv("CONTENT_TYPE") or "application/json"),
+			"Content-Length: " .. #body,
+			"Connection: close",
+			"",
+			body,
+		}
+		local ok_send, err_send = pcall(function() return sock:send(table.concat(hdrs, "\r\n")) end)
+		if not ok_send then
+			pcall(function() sock:close() end)
+			out("502 Bad Gateway", "application/json; charset=utf-8",
+			    '{"code":1,"msg":"send failed: ' .. tostring(err_send):gsub('"', "'") .. '"}')
+			return true
+		end
+
+		local chunks = {}
+		while true do
+			local ok_recv, chunk = pcall(function() return sock:recv(8192) end)
+			if not ok_recv or type(chunk) ~= "string" or #chunk == 0 then break end
+			chunks[#chunks + 1] = chunk
+		end
+		pcall(function() sock:close() end)
+		local raw = table.concat(chunks)
+
+		local head, rbody = raw:match("^(.-)\r\n\r\n(.*)$")
+		if not head then
+			out("502 Bad Gateway", "application/json; charset=utf-8",
+			    '{"code":1,"msg":"bad backend response"}')
+			return true
+		end
+
+		-- 解 chunked（对齐 istore_backend.lua 的 chunksource 语义）
+		if head:lower():find("transfer%-encoding:%s*chunked") then
+			local dec, pos = {}, 1
+			while true do
+				local nl = rbody:find("\r\n", pos, true)
+				if not nl then break end
+				local hexlen = rbody:sub(pos, nl - 1):gsub("%s", "")
+				local n = tonumber(hexlen, 16)
+				if not n or n <= 0 then break end
+				dec[#dec + 1] = rbody:sub(nl + 2, nl + 1 + n)
+				pos = nl + 2 + n + 2
+			end
+			rbody = table.concat(dec)
+		end
+
+		local ctype = head:match("[Cc]ontent%-[Tt]ype:%s*([^\r\n]+)")
+			or "application/json; charset=utf-8"
+		local code = tonumber(head:match("^HTTP/%d%.%d%s+(%d+)")) or 200
+		local reasons = {
+			[200] = "OK", [201] = "Created", [204] = "No Content",
+			[301] = "Moved Permanently", [302] = "Found", [304] = "Not Modified",
+			[400] = "Bad Request", [401] = "Unauthorized", [403] = "Forbidden",
+			[404] = "Not Found", [405] = "Method Not Allowed",
+			[500] = "Internal Server Error", [502] = "Bad Gateway",
+			[503] = "Service Unavailable",
+		}
+		-- KP-QUICKSTART-PATCH v2: 补齐被 Go `,omitempty` 抹掉的字段
+		if code == 200 and type(kp_qs_patch_dispatch) == "function" then
+			local ok_p, patched = pcall(kp_qs_patch_dispatch, pi, rbody)
+			if ok_p and type(patched) == "string" and #patched > 0 then
+				rbody = patched
+			end
+		end
+
+		out(code .. " " .. (reasons[code] or "Status"), ctype, rbody)
+		return true
+	end
+
+	if kp_qs_proxy() then
+		return
+	end
+end
+-- KP-QUICKSTART-PROXY v2 END =============================================
+
+-- KP-QUICKSTART-VIEWNS v3 START ==========================================
+-- ⚠ 为什么必须自建 viewns、为什么挂在 parser.parse 里（2026-09-27 实测定论）：
+--
+-- (1) 症状：/admin/quickstart 返回 200，但 maincontent 是空的（无 div#app），
+--     且响应在 sidebar 脚本后**被截断**（没有 </body></html>）。
+--
+-- (2) 已定论根因（2026-09-27，实测见 p4_probe_v6-v10）：
+--     **main.htm 模板自身的两个坑，与 viewns 无关** ——
+--       (A) Lua 注释里写了模板标签（尖括号百分号）→ 提前闭合 Lua 块 → 代码被当 HTML 直出；
+--       (B) 模板内 require("luci.dispatcher") → 循环 require → cacheloader 协程被打断。
+--     两者都表现为「200 静默截断」。相关规避已由私有 view/quickstart/main.htm 处理。
+--
+-- (3) ★ 关于 viewns：**不必自建**。
+--     实测（p4_probe_v4）ctx 表跨请求复用、viewns 装一次即长期有效；
+--     且真实请求里 viewns 本来就由 dispatcher 正常装配到位。
+--     下面这段保留仅作**兜底**（万一某条路径 viewns 为 nil 时避免 "attempt to
+--     index field 'viewns' (a nil value)"），正常不生效。
+do
+	local ok_tpl, tpl = pcall(require, "luci.template")
+	if ok_tpl and type(tpl) == "table" and type(tpl.Template) == "table"
+	   and tpl.context ~= nil then
+		local ok_p, parser = pcall(require, "luci.template.parser")
+		if ok_p and type(parser) == "table" and type(parser.parse) == "function" then
+			local kp_orig_parse = parser.parse
+			local kp_installed = false
+
+			local function kp_install_viewns()
+				if kp_installed then return end
+				local ctx = tpl.context
+				if type(ctx) ~= "table" then return end
+				-- 已被 dispatcher 正常装配过就不动（幂等）
+				if ctx.viewns ~= nil then kp_installed = true; return end
+
+				local ok_u, util = pcall(require, "luci.util")
+				local ok_h, http = pcall(require, "luci.http")
+				local i18n
+				pcall(function() i18n = require "luci.i18n" end)
+				if not ok_u or type(util) ~= "table" then util = {} end
+
+				local media = "/luci-static/bootstrap"
+				pcall(function()
+					media = require("luci.config").main.mediaurlbase or media
+				end)
+				local theme = media:match("([^/]+)$") or "bootstrap"
+
+				local ok_d, disp = pcall(require, "luci.dispatcher")
+
+				ctx.viewns = setmetatable({
+					write      = (ok_h and http.write) or function(s) io.write(tostring(s or "")) end,
+					include    = function(name) return tpl.Template(name):render(getfenv(2)) end,
+					translate  = (i18n and i18n.translate) or function(s) return s end,
+					translatef = (i18n and i18n.translatef) or function(s, ...) return s end,
+					export     = function(k, v)
+						if ctx.viewns[k] == nil then ctx.viewns[k] = v end
+					end,
+					striptags  = util.striptags or function(s) return s end,
+					pcdata     = util.pcdata or function(s) return tostring(s or "") end,
+					media      = media,
+					theme      = theme,
+					resource   = "/luci-static/resources",
+					ifattr     = function(...) return "" end,
+					attr       = function(...) return "" end,
+					url        = (ok_d and disp.build_url) or function(...) return "" end,
+				}, { __index = function(table, key)
+					if key == "controller" then
+						return (ok_d and disp.build_url()) or ""
+					elseif key == "token" then
+						local t = ""
+						if ok_d then
+							pcall(function()
+								t = tostring(disp.context and disp.context.authsession or "")
+							end)
+						end
+						if t == "" then
+							t = (os.getenv("HTTP_COOKIE") or "")
+								:match("sysauth=([0-9a-fA-F]+)") or ""
+						end
+						return t
+					else
+						return rawget(table, key) or _G[key]
+					end
+				end })
+				kp_installed = true
+			end
+
+			parser.parse = function(path, ...)
+				kp_install_viewns()
+				return kp_orig_parse(path, ...)
+			end
+		end
+	end
+end
+-- KP-QUICKSTART-VIEWNS v3 END ============================================
+
+luci.dispatcher.indexcache = "/tmp/luci-indexcache-bootstrap"
+luci.sgi.cgi.run()

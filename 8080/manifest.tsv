@@ -1,0 +1,87 @@
+# id	group	feature	kind	subject	pattern	expect	level	gate	fix	fixarg	desc
+# ----------------------------------------------------------------------
+# 8080 实例判据表。字段：id / group / feature(中文功能名,空=不进功能清单) / kind /
+#   subject / pattern / expect / level(PASS门槛) / gate(auto|deploy|shared|manual) /
+#   fix(none|symlink|clear_cache|uci_set|deploy) / fixarg / desc
+# kind: filehash fileexists dir dircount text_count pair substr symlink menu_node
+#       http_code http_body static_code uci_get cache_pair loopback_code
+#       portal_card_count portal_body
+# 期望值来自 2026-09-28 真机只读抄录；@{LAN} 由脚本替换为实例监听 IP。
+# TAB 分隔；desc 内禁 TAB。
+D-01	file	8080 CGI 包装器（dispatcher）	filehash	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	-	54998:db09b091dd4fe21d61920c8b5f25f8d2	FAIL	deploy	deploy	disp	1467 行定制逻辑，14 个 KP 标记族的载体；字节:md5 双断言（EOF 换行丢了就变 54997:88a47acd…）
+D-02	file		dircount	/overlay/nradio-apps/openwrt-luci-8080/usr/lib/lua/luci/view	-	4	FAIL	deploy	none	-	私有视图命名空间应含 admin_status / quickstart / themes / ttyd 四个子目录
+D-03	file	8080 登录页模板	filehash	/overlay/nradio-apps/openwrt-luci-8080/usr/lib/lua/luci/view/admin_status/nradio_8080_sysauth.htm	-	6222:a06356a29e370a048a9dcc842c9489cd	FAIL	deploy	deploy	view:admin_status/nradio_8080_sysauth.htm	实例私有视图；缺失即回退共享视图（或 404/500）
+D-04	file	蜂窝 / AT 指令页	filehash	/overlay/nradio-apps/openwrt-luci-8080/usr/lib/lua/luci/view/admin_status/nradio_cellular.htm	-	28342:c0fa6ab8afee33c9cb826bc91e4452b0	FAIL	deploy	deploy	view:admin_status/nradio_cellular.htm	实例私有视图；缺失即回退共享视图（或 404/500）
+D-05	file	设备总览（卡片化）	filehash	/overlay/nradio-apps/openwrt-luci-8080/usr/lib/lua/luci/view/admin_status/nradio_details.htm	-	33204:25f9e3242fe0e1cd6196a31b4dfef880	FAIL	deploy	deploy	view:admin_status/nradio_details.htm	实例私有视图；缺失即回退共享视图（或 404/500）
+D-06	file		filehash	/overlay/nradio-apps/openwrt-luci-8080/usr/lib/lua/luci/view/admin_status/nradio_device.htm	-	14046:a9756e8e9066d759afabb5f41a6579fe	FAIL	deploy	deploy	view:admin_status/nradio_device.htm	实例私有视图；缺失即回退共享视图（或 404/500）
+D-07	file		filehash	/overlay/nradio-apps/openwrt-luci-8080/usr/lib/lua/luci/view/admin_status/nradio_sms.htm	-	9369:8b2cf29996d7d5305ccf73707b8d13e0	FAIL	deploy	deploy	view:admin_status/nradio_sms.htm	实例私有视图；缺失即回退共享视图（或 404/500）
+D-08	file		filehash	/overlay/nradio-apps/openwrt-luci-8080/usr/lib/lua/luci/view/quickstart/home.htm	-	409:6370488723c57d656d6a2e9366bd0716	FAIL	deploy	deploy	view:quickstart/home.htm	实例私有视图；缺失即回退共享视图（或 404/500）
+D-09	file	网络向导视图	filehash	/overlay/nradio-apps/openwrt-luci-8080/usr/lib/lua/luci/view/quickstart/main.htm	-	3425:86586d5345a348601d4a86e138ef0829	FAIL	deploy	deploy	view:quickstart/main.htm	实例私有视图；缺失即回退共享视图（或 404/500）
+D-10	file		filehash	/overlay/nradio-apps/openwrt-luci-8080/usr/lib/lua/luci/view/quickstart/wizard.htm	-	376:267e0eacc9d7a25414ff4b1916f0af14	FAIL	deploy	deploy	view:quickstart/wizard.htm	实例私有视图；缺失即回退共享视图（或 404/500）
+D-11	file		filehash	/overlay/nradio-apps/openwrt-luci-8080/usr/lib/lua/luci/view/themes/bootstrap/footer.htm	-	2214:404b0e4a8bc103874006dda9414fc8be	FAIL	deploy	deploy	view:themes/bootstrap/footer.htm	实例私有视图；缺失即回退共享视图（或 404/500）
+D-12	file	实例主题头（bootstrap）	filehash	/overlay/nradio-apps/openwrt-luci-8080/usr/lib/lua/luci/view/themes/bootstrap/header.htm	-	10741:1c3bfd1154d10fdc39d9fca61e06ed3f	FAIL	deploy	deploy	view:themes/bootstrap/header.htm	实例私有视图；缺失即回退共享视图（或 404/500）
+D-13	file		filehash	/overlay/nradio-apps/openwrt-luci-8080/usr/lib/lua/luci/view/themes/bootstrap/header_login.htm	-	5488:97d0072fee359cd5ce17d3424b2f71b9	FAIL	deploy	deploy	view:themes/bootstrap/header_login.htm	实例私有视图；缺失即回退共享视图（或 404/500）
+D-14	file		filehash	/overlay/nradio-apps/openwrt-luci-8080/usr/lib/lua/luci/view/themes/bootstrap/out_header_login.htm	-	335:77c2ce4f46b0097cccc2b0cba6e68e18	FAIL	deploy	deploy	view:themes/bootstrap/out_header_login.htm	实例私有视图；缺失即回退共享视图（或 404/500）
+D-15	file	ttyd 终端页（私有视图）	filehash	/overlay/nradio-apps/openwrt-luci-8080/usr/lib/lua/luci/view/ttyd/overview.htm	-	10072:cf2d435b195de415f51b07eef13711bf	FAIL	deploy	deploy	view:ttyd/overview.htm	实例私有视图；缺失即回退共享视图（或 404/500）
+D-16	file	iStoreRouter 控制器	filehash	/usr/lib/lua/luci/controller/istorerouter.lua	-	4467:3081b27df0a8d1ae94d386d3ffce27a5	FAIL	shared	deploy	ctrl:istorerouter.lua	★共享目录，80 口也在用；落位后必须双侧探活
+D-17	file	网络向导控制器	filehash	/usr/lib/lua/luci/controller/quickstart.lua	-	6748:1f1b67c62aeb103c81164f12a4523f1e	FAIL	shared	deploy	ctrl:quickstart.lua	★共享目录，80 口也在用；落位后必须双侧探活
+D-18	file	系统便利工具控制器	filehash	/usr/lib/lua/luci/controller/systools.lua	-	6101:0e699b388529c378b94be718b0cb73e4	FAIL	shared	deploy	ctrl:systools.lua	★共享目录，80 口也在用；落位后必须双侧探活
+D-19	file		fileexists	/usr/share/luci/menu.d/luci-app-istorerouter.json	-	1	FAIL	deploy	none	-	iStoreRouter 的 menu.d 定义
+D-20	file		fileexists	/usr/share/luci/menu.d/luci-app-quickstart.json	-	1	FAIL	deploy	none	-	quickstart 的 menu.d 定义
+M-01	marker	仅 8080 生效守卫（SERVER_PORT）	text_count	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	^if os[.]getenv[(]"SERVER_PORT"[)] ~= "8080" then$	1	FAIL	manual	none	-	非 8080 端口请求一律 404；★PC 代理假阴性 404 的根因，绝不可自动改
+M-02	marker	INDEXCACHE 隔离	text_count	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	^luci[.]dispatcher[.]indexcache = "/tmp/luci-indexcache-bootstrap"$	1	FAIL	deploy	deploy	disp	与 80 口 /tmp/luci-indexcache 隔离，避免互相污染
+M-03	marker	ttyd 私有视图块	pair	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	^[[:space:]]*-- KP-TTYD-VIEW-MARKER-BEGIN$	1	FAIL	deploy	deploy	disp	成对【后缀式】-BEGIN/-END（无版本号）
+M-04	marker	蜂窝菜单块	pair	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	^[[:space:]]*-- KP-CELLULAR-MENU-BEGIN$	1	FAIL	deploy	deploy	disp	成对【后缀式】-BEGIN/-END
+M-05	marker	quickstart 菜单块	pair	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	^[[:space:]]*-- KP-QUICKSTART-MENU-BEGIN$	1	FAIL	deploy	deploy	disp	成对【后缀式】-BEGIN/-END
+M-06	marker	iStoreRouter 菜单块	pair	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	^[[:space:]]*-- KP-ISTOREROUTER-MENU v[0-9]+ BEGIN$	1	FAIL	deploy	deploy	disp	成对【vN BEGIN/END】；注册 admin/istorerouter 节点
+M-07	marker	NAS 父节点修复	pair	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	^[[:space:]]*-- KP-NAS-PARENT-CGI v[0-9]+ BEGIN$	1	FAIL	deploy	deploy	disp	成对【vN BEGIN/END】；修 admin/nas 整树 500（no parent node）
+M-08	marker	蜂窝 AT 端点（约 450 行）	pair	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	^[[:space:]]*-- KP-CELLULAR-ENDPOINT v[0-9]+ START	1	FAIL	manual	deploy	disp	成对【vN START/END】★注意行尾还有 ==== 装饰，锚点不能加 $
+M-09	marker	quickstart 字段补齐	pair	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	^[[:space:]]*-- KP-QUICKSTART-PATCH v[0-9]+ START	1	FAIL	deploy	deploy	disp	成对【vN START/END】；补齐被 Go `,omitempty` 抹掉的字段（L1354 另有一处行内提及）
+M-10	marker	quickstart 后端反代	pair	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	^[[:space:]]*-- KP-QUICKSTART-PROXY v[0-9]+ START	1	FAIL	deploy	deploy	disp	成对【vN START/END】（L940 另有一处行内提及）
+M-11	marker	quickstart 视图命名空间隔离	pair	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	^[[:space:]]*-- KP-QUICKSTART-VIEWNS v[0-9]+ START	1	FAIL	deploy	deploy	disp	成对【vN START/END】
+M-12	marker	iStoreRouter 视图白名单	text_count	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	^[[:space:]]*-- KP-ISTOREROUTER-VIEW v[0-9]+	1	FAIL	deploy	deploy	disp	单行型；允许 istorerouter/{index,main,main_dev}.htm 走私有视图
+M-13	marker	服务入口侧栏块	text_count	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	^-- KP-SERVICES-MARKER v[0-9]+	1	FAIL	manual	deploy	disp	单行型（行首横幅注释，块体另在别处）
+M-14	marker	进程页空白修复	text_count	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	^-- KP-PROCESSES-MARKER v[0-9]+	1	FAIL	manual	deploy	disp	单行型（行首横幅注释）
+M-15	marker	quickstart 视图 overlay	text_count	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	KP-QUICKSTART-VIEW([ :]|$)	2	WARN	deploy	none	-	★禁止裸 grep：KP-QUICKSTART-VIEWNS 是其子串，裸计数会误得 4
+M-16	marker	进程页 TOP 垫片	substr	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	KP-TOP-SHIM	1	WARN	manual	none	-	★全文件仅在 L437 行内提及出现，行首锚定恒为 0，故只能用子串判定
+N-01	menu	原生插件聚合入口	menu_node	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	admin\.nodes\.nradio_plugins[[:space:]]*=	1	FAIL	deploy	deploy	disp	createtree() 注册的自定义菜单节点
+N-02	menu	状态（含设备总览）	menu_node	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	admin\.nodes\.status[[:space:]]*=	1	FAIL	deploy	deploy	disp	createtree() 注册的自定义菜单节点
+N-03	menu	网络向导	menu_node	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	admin\.nodes\.quickstart[[:space:]]*=	1	FAIL	deploy	deploy	disp	createtree() 注册的自定义菜单节点
+N-04	menu	网络设置	menu_node	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	admin\.nodes\.network_guide[[:space:]]*=	1	FAIL	deploy	deploy	disp	createtree() 注册的自定义菜单节点
+N-05	menu	iStoreRouter	menu_node	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	admin\.nodes\.istorerouter[[:space:]]*=	1	FAIL	deploy	deploy	disp	createtree() 注册的自定义菜单节点
+N-06	menu	服务（鲲鹏商店/1Panel/Docker）	menu_node	/overlay/nradio-apps/openwrt-luci-8080/www/cgi-bin/luci	admin\.nodes\.kp_services[[:space:]]*=	1	FAIL	deploy	deploy	disp	createtree() 注册的自定义菜单节点
+S-01	symlink	ARGON 主题映射（相对目标）	symlink	/overlay/nradio-apps/openwrt-luci-8080/www/luci-static/argon	bootstrap	1	FAIL	auto	symlink	argon|bootstrap	8080 白名单 docroot：无软链即 404（HTTP 200 假象常见）
+S-02	symlink	systools 的 iform SPA	symlink	/overlay/nradio-apps/openwrt-luci-8080/www/luci-static/iform	/www/luci-static/iform	1	FAIL	auto	symlink	iform|/www/luci-static/iform	8080 白名单 docroot：无软链即 404（HTTP 200 假象常见）
+S-03	symlink	iStore 商店静态资源	symlink	/overlay/nradio-apps/openwrt-luci-8080/www/luci-static/istore	/www/luci-static/istore	1	FAIL	auto	symlink	istore|/www/luci-static/istore	8080 白名单 docroot：无软链即 404（HTTP 200 假象常见）
+S-04	symlink	★iStoreRouter SPA（缺则空白）	symlink	/overlay/nradio-apps/openwrt-luci-8080/www/luci-static/istorerouter	/www/luci-static/istorerouter	1	FAIL	auto	symlink	istorerouter|/www/luci-static/istorerouter	8080 白名单 docroot：无软链即 404（HTTP 200 假象常见）
+S-05	symlink	易有云文件管理器	symlink	/overlay/nradio-apps/openwrt-luci-8080/www/luci-static/linkeasefile	/www/luci-static/linkeasefile	1	FAIL	auto	symlink	linkeasefile|/www/luci-static/linkeasefile	8080 白名单 docroot：无软链即 404（HTTP 200 假象常见）
+S-06	symlink	内网穿透	symlink	/overlay/nradio-apps/openwrt-luci-8080/www/luci-static/natpierce	/www/luci-static/natpierce	1	FAIL	auto	symlink	natpierce|/www/luci-static/natpierce	8080 白名单 docroot：无软链即 404（HTTP 200 假象常见）
+S-07	symlink	原厂 nradio 资源	symlink	/overlay/nradio-apps/openwrt-luci-8080/www/luci-static/nradio	/www/luci-static/nradio	1	FAIL	auto	symlink	nradio|/www/luci-static/nradio	8080 白名单 docroot：无软链即 404（HTTP 200 假象常见）
+S-08	symlink	网络向导静态资源	symlink	/overlay/nradio-apps/openwrt-luci-8080/www/luci-static/quickstart	/www/luci-static/quickstart	1	FAIL	auto	symlink	quickstart|/www/luci-static/quickstart	8080 白名单 docroot：无软链即 404（HTTP 200 假象常见）
+S-09	symlink	LuCI 核心 JS 资源	symlink	/overlay/nradio-apps/openwrt-luci-8080/www/luci-static/resources	/www/luci-static/resources	1	FAIL	auto	symlink	resources|/www/luci-static/resources	8080 白名单 docroot：无软链即 404（HTTP 200 假象常见）
+S-10	symlink	实例主题实体目录	dir	/overlay/nradio-apps/openwrt-luci-8080/www/luci-static/bootstrap	-	1	FAIL	deploy	none	-	bootstrap 实体目录（argon 软链指向它）
+C-01	cfg	8080 实例开关	uci_get	uhttpd.openwrt8080.enabled	-	1	FAIL	auto	uci_set	uhttpd.openwrt8080.enabled=1	关掉即整站不可达（只允许改本段 key）
+C-02	cfg	8080 监听地址（仅 LAN）	uci_get	uhttpd.openwrt8080.listen_http	-	@{LAN}:8080	FAIL	auto	none	-	★只绑 LAN；探测必须打该地址，127.0.0.1 恒 000（见 C-06 负向断言）
+C-03	cfg	8080 docroot	uci_get	uhttpd.openwrt8080.home	-	/overlay/nradio-apps/openwrt-luci-8080/www	FAIL	auto	none	-	白名单式 docroot，指向错则整站 404
+C-04	cfg		cache_pair	/tmp	luci-indexcache	1	WARN	manual	none	-	两份索引缓存（80 的 luci-indexcache 与 8080 的 -bootstrap）应同时存在且大小一致
+C-05	cfg	Argon 配置层（风格化）	fileexists	/etc/config/argon	-	1	WARN	manual	none	-	当前设备缺失 → 实例回落到 bootstrap 观感；由 kp-style.sh 选项 3 负责，本脚本只报不修
+C-06	cfg		loopback_code	/luci-static/resources/x.js	-	000	INFO	manual	none	-	负向：证明实例只绑 LAN。若此处非 000 说明监听被改，需人工确认
+H-01	http	设备总览页	http_code	admin/status/details	-	200	FAIL	auto	none	-	登录后落点页
+H-02	http	iStoreRouter SPA	http_code	admin/istorerouter	-	200	FAIL	auto	none	-	路由由 KP-ISTOREROUTER-MENU 注册
+H-03	http		http_body	admin/istorerouter	E	arch:"aarch64_cortex-a53"	FAIL	auto	none	-	★模板报错会被 200 包着内联进正文，必须取正文断言真值
+H-04	http		http_body	admin/istorerouter	E	uid:"eaac6e3c4d16c50b6a04e8aea2c615ff"	FAIL	auto	none	-	同理：uid 必须是真值，不是 "Status: 500..."
+H-05	http		http_body	admin/istorerouter	F	Internal Server Error	FAIL	auto	none	-	pattern=F 语义 = 正文【不得包含】
+H-06	http	系统便利工具 systools	http_code	admin/system/systools/pages	-	200	FAIL	auto	none	-	iStoreOS iform SPA
+H-07	http		http_body	admin/system/systools/pages	F	Internal Server Error	FAIL	auto	none	-	
+H-08	http		http_body	admin/system/systools/pages	E	/luci-static/iform/	FAIL	auto	none	-	必须引用 iform SPA
+H-09	http	网络向导 quickstart	http_code	admin/quickstart/	-	200	FAIL	auto	none	-	
+H-10	http		http_code	admin/status/overview	-	200	FAIL	auto	none	-	
+H-11	http		http_code	admin/zzz-nonexistent	-	404	FAIL	auto	none	-	负向对照：不存在的路由必须 404（同时证明已登录，否则会 403）
+H-12	static	iform SPA 静态资源	static_code	/luci-static/iform/1.1/index.js	-	200	FAIL	auto	none	-	基准是 http://<lan>:8080（不是 /cgi-bin/luci 下）
+H-13	static	iStoreRouter 静态资源	static_code	/luci-static/istorerouter/index.js	-	200	FAIL	auto	none	-	
+H-14	static	quickstart 静态资源	static_code	/luci-static/quickstart/index.js	-	200	FAIL	auto	none	-	
+H-15	static		static_code	/luci-static/foo/bar.js	-	404	FAIL	auto	none	-	负向对照：无软链的资源必须 404（证明白名单确实生效）
+P-01	portal	80 口门户 v3（四卡片）	filehash	/www/cgi-bin/portal	-	14423:9360ce8c9b0421ebb39c11306949861f	FAIL	deploy	deploy	portal	四卡片：istore os风格化(弹层内嵌 iStoreRouter) / 高级设置(新标签 quickstart) / 美化版界面(:10086) / 官方界面
+P-02	portal		portal_card_count	/www/cgi-bin/portal	class="t1"	4	FAIL	deploy	none	-	正文应有 4 个卡片标题
+P-03	portal		portal_body	/www/cgi-bin/portal	E	:8080/cgi-bin/luci/admin/istorerouter	FAIL	deploy	none	-	iStoreRouter 入口 URL 必须按 HTTP_HOST 动态生成
+P-04	portal		portal_body	/www/cgi-bin/portal	E	:8080/cgi-bin/luci/admin/quickstart/	FAIL	deploy	none	-	高级设置入口 URL

@@ -1,0 +1,354 @@
+<%#
+ NRadio device status for the isolated LuCI instance on port 8080.
+ 数据源：ubus infocd runtime / ubus system board / luci.sys / nixio.fs
+ 只读页面，无写操作。
+-%>
+<%
+	local fs = require "nixio.fs"
+	local sys = require "luci.sys"
+	local util = require "luci.util"
+	local jsonc = require "luci.jsonc"
+	local http = require "luci.http"
+
+	local NET = "cpe"
+
+	local function trim(v)
+		return (tostring(v or ""):gsub("^%s+", ""):gsub("%s+$", ""))
+	end
+
+	local function ubus(obj, method, args)
+		local cmd = "ubus call " .. obj .. " " .. method
+		if args then cmd = cmd .. " '" .. args .. "'" end
+		local raw = sys.exec(cmd .. " 2>/dev/null") or ""
+		local ok, data = pcall(jsonc.parse, raw)
+		if ok and type(data) == "table" then return data end
+		return nil
+	end
+
+	local function fmt(bytes)
+		local n = tonumber(bytes) or 0
+		if n >= 1099511627776 then return string.format("%.2f TiB", n / 1099511627776) end
+		if n >= 1073741824 then return string.format("%.2f GiB", n / 1073741824) end
+		if n >= 1048576 then return string.format("%.2f MiB", n / 1048576) end
+		if n >= 1024 then return string.format("%.1f KiB", n / 1024) end
+		return tostring(n) .. " B"
+	end
+
+	local function fmt_dur(sec)
+		local s = tonumber(sec) or 0
+		if s <= 0 then return "-" end
+		local d = math.floor(s / 86400)
+		local h = math.floor((s % 86400) / 3600)
+		local m = math.floor((s % 3600) / 60)
+		if d > 0 then return string.format("%d 天 %d 小时 %d 分", d, h, m) end
+		if h > 0 then return string.format("%d 小时 %d 分", h, m) end
+		return string.format("%d 分 %d 秒", m, s % 60)
+	end
+
+	local function sig_class(rsrp)
+		local v = tonumber(rsrp)
+		if not v or v == 0 then return "kpc-sig-none" end
+		if v >= -85 then return "kpc-sig-1" end
+		if v >= -95 then return "kpc-sig-2" end
+		if v >= -105 then return "kpc-sig-3" end
+		if v >= -115 then return "kpc-sig-4" end
+		return "kpc-sig-5"
+	end
+
+	local function sig_pct(rsrp)
+		local v = tonumber(rsrp)
+		if not v or v == 0 then return 0 end
+		local pct = math.floor((v + 140) * 100 / 60)
+		if pct < 5 then pct = 5 end
+		if pct > 100 then pct = 100 end
+		return pct
+	end
+
+	-- 板卡信息
+	local board = ubus("system", "board") or {}
+	local model_name = trim(board.model)
+	if model_name == "" then model_name = "NRadio" end
+
+	-- 设备运行状态（infocd runtime）
+	local rt = ubus("infocd", "runtime") or {}
+	local g = type(rt.global) == "table" and rt.global or {}
+
+	-- 内存
+	local mem_total, mem_free, mem_buffered = 0, 0, 0
+	local meminfo = fs.readfile("/proc/meminfo") or ""
+	mem_total = tonumber(meminfo:match("MemTotal:%s*(%d+)")) or 0
+	mem_free = tonumber(meminfo:match("MemAvailable:%s*(%d+)")) or 0
+	if mem_free == 0 then
+		local f = tonumber(meminfo:match("\nMemFree:%s*(%d+)")) or 0
+		local b = tonumber(meminfo:match("\nBuffers:%s*(%d+)")) or 0
+		local c = tonumber(meminfo:match("\nCached:%s*(%d+)")) or 0
+		mem_free = f + b + c
+	end
+	local mem_used = mem_total > mem_free and (mem_total - mem_free) or 0
+	local mem_pct = mem_total > 0 and math.floor(mem_used * 100 / mem_total) or 0
+
+	-- CPU
+	local load1, load5, load15 = 0, 0, 0
+	local loadavg = fs.readfile("/proc/loadavg") or ""
+	do
+		local a, b, c = loadavg:match("([%d%.]+)%s+([%d%.]+)%s+([%d%.]+)")
+		load1 = tonumber(a) or 0; load5 = tonumber(b) or 0; load15 = tonumber(c) or 0
+	end
+	local cpu_count = 0
+	local cpuinfo = fs.readfile("/proc/cpuinfo") or ""
+	for _ in cpuinfo:gmatch("processor%s*:") do cpu_count = cpu_count + 1 end
+	if cpu_count == 0 then cpu_count = 1 end
+
+	-- 运行时间
+	local uptime_raw = fs.readfile("/proc/uptime") or ""
+	local uptime = tonumber(uptime_raw:match("^([%d%.]+)")) or 0
+
+	-- 蜂窝线路（用于概览卡片）
+	local cellular = {}
+	do
+		local d = ubus("infocd", "cpestatus", '{"name":"' .. NET .. '"}')
+		local list = d and d.result
+		if type(list) == "table" then
+			for _, entry in ipairs(list) do
+				local st = entry.status
+				if type(st) == "table" and (trim(st.model) ~= "" or trim(st.mode) ~= "") then
+					cellular[#cellular + 1] = {
+						name = trim(st.name),
+						mode = trim(st.mode),
+						isp = trim(st.isp_company or st.isp),
+						rsrp = trim(st.rsrp),
+						sinr = trim(st.sinr),
+						band = trim(st.band),
+						temp = trim(st.model_temp),
+						up = tonumber(entry.up) == 1,
+					}
+				end
+			end
+		end
+	end
+
+	-- 磁盘
+	local function disk(path)
+		local out = sys.exec("df -h " .. path .. " 2>/dev/null | awk 'NR==2{print $2\" / \"$4\" 可用\"}'") or ""
+		out = trim(out)
+		return out ~= "" and out or "-"
+	end
+
+	-- 温度
+	local function temp_of(path)
+		local v = fs.readfile(path)
+		local n = tonumber(v)
+		if n and n > 1000 then return string.format("%.1f °C", n / 1000) end
+		if n then return string.format("%.1f °C", n) end
+		return nil
+	end
+	local cpu_temp = temp_of("/sys/class/thermal/thermal_zone0/temp")
+		or temp_of("/sys/class/hwmon/hwmon0/temp1_input") or "-"
+
+	-- 终端列表
+	local terminals = {}
+	do
+		local d = ubus("infocd", "terminal", '{"type":"all"}')
+		local clients = d and d.client
+		if type(clients) == "table" then
+			for mac, c in pairs(clients) do
+				if type(c) == "table" then
+					terminals[#terminals + 1] = {
+						mac = mac,
+						ip = trim(c.ipaddr),
+						host = trim(c.hostname),
+						rssi = trim(c.rssi),
+						typ = trim(c.type),
+						ssid = trim(c.ssid),
+						tx = tonumber(c.txbytes) or 0,
+						rx = tonumber(c.rxbytes) or 0,
+					}
+				end
+			end
+			table.sort(terminals, function(a, b) return (a.ip or "") < (b.ip or "") end)
+		end
+	end
+
+	-- 网口
+	local ports = ubus("nrswitch", "status") or {}
+
+	-- 网络接口地址
+	local function ifaddr(dev)
+		local out = sys.exec("ip -4 addr show " .. dev .. " 2>/dev/null | grep -o 'inet [0-9.]*' | head -1") or ""
+		return trim(out:gsub("inet%s+", ""))
+	end
+
+	local wan_ip = trim(g.wan_ip or "")
+	if wan_ip == "" then wan_ip = ifaddr("eth1") end
+	if wan_ip == "" then wan_ip = ifaddr("wan") end
+	local lan_ip = ifaddr("br-lan")
+-%>
+<%+header%>
+
+<style type="text/css">
+.kpc-cell { margin-bottom: 18px; }
+.kpc-cell .kpc-hd {
+	display: flex; align-items: center; justify-content: space-between;
+	gap: 10px; flex-wrap: wrap; margin-bottom: 8px;
+}
+.kpc-cell .kpc-hd h3 { margin: 0; font-size: 16px; }
+.kpc-grid {
+	display: grid; gap: 10px;
+	grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+}
+.kpc-item {
+	border: 1px solid rgba(0,0,0,.09);
+	border-radius: 10px; padding: 9px 12px;
+	background: rgba(0,0,0,.015);
+}
+.kpc-item > span { display: block; font-size: 12px; opacity: .68; margin-bottom: 3px; }
+.kpc-item > strong { font-size: 15px; font-weight: 600; word-break: break-all; }
+.kpc-sig-wrap { display: flex; align-items: center; gap: 8px; }
+.kpc-sig-bar { flex: 1; height: 8px; border-radius: 4px; background: rgba(0,0,0,.08); overflow: hidden; }
+.kpc-sig-bar > i { display: block; height: 100%; border-radius: 4px; background: var(--primary, #5e72e4); }
+.kpc-sig-1 > i { background: #22a06b; } .kpc-sig-2 > i { background: #56a943; }
+.kpc-sig-3 > i { background: #d8a01a; } .kpc-sig-4 > i { background: #e07b1f; }
+.kpc-sig-5 > i { background: #d64545; } .kpc-sig-none > i { background: #9aa0a8; }
+.kpc-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.kpc-table th, .kpc-table td { padding: 6px 9px; text-align: left; border-bottom: 1px solid rgba(0,0,0,.07); }
+.kpc-table th { font-weight: 600; font-size: 12px; opacity: .72; }
+.kpc-table tr:last-child td { border-bottom: 0; }
+.kpc-pill {
+	display: inline-block; padding: 1px 8px; border-radius: 9px;
+	font-size: 12px; line-height: 18px;
+	background: rgba(94,114,228,.13); color: var(--primary, #5e72e4);
+}
+.kpc-pill.kpc-on { background: rgba(34,160,107,.15); color: #1d8a5b; }
+.kpc-pill.kpc-off { background: rgba(0,0,0,.07); opacity: .7; }
+.kpc-hint { font-size: 12px; opacity: .65; margin: 6px 0 0; }
+.kpc-nowarn { font-size: 12px; opacity: .7; }
+
+/* ---- 深色适配：见 kpc-cellular.htm 顶部说明（主题走 prefers-color-scheme） ---- */
+@media (prefers-color-scheme: dark) {
+	.kpc-item { border-color: rgba(255,255,255,.12); background: rgba(255,255,255,.035); }
+	.kpc-table th, .kpc-table td { border-bottom-color: rgba(255,255,255,.09); }
+	.kpc-sig-bar { background: rgba(255,255,255,.1); }
+	.kpc-pill { background: rgba(94,114,228,.22); }
+	.kpc-pill.kpc-off { background: rgba(255,255,255,.09); }
+	.kpc-cell { background: rgba(37,37,38,.5); border-color: rgba(255,255,255,.1); }
+}
+body.dark .kpc-item { border-color: rgba(255,255,255,.12); background: rgba(255,255,255,.035); }
+body.dark .kpc-table th, body.dark .kpc-table td { border-bottom-color: rgba(255,255,255,.09); }
+body.dark .kpc-sig-bar { background: rgba(255,255,255,.1); }
+body.dark .kpc-pill { background: rgba(94,114,228,.22); }
+body.dark .kpc-pill.kpc-off { background: rgba(255,255,255,.09); }
+</style>
+
+<h2 name="content"><%=pcdata(model_name)%> · 设备状态</h2>
+
+<!-- ====================== 概览 ====================== -->
+<div class="kpc-cell">
+	<div class="kpc-hd"><h3>运行概览</h3></div>
+	<div class="kpc-grid">
+		<div class="kpc-item"><span>CPU 使用率</span><strong><%=pcdata((g.cpu_percent and (g.cpu_percent .. " %")) or "-")%></strong></div>
+		<div class="kpc-item"><span>内存使用率</span><strong><%=mem_pct%> % <span class="kpc-nowarn">（<%=pcdata(fmt(mem_used * 1024))%> / <%=pcdata(fmt(mem_total * 1024))%>）</span></strong></div>
+		<div class="kpc-item"><span>系统负载（1/5/15 分）</span><strong><%=string.format("%.2f / %.2f / %.2f", load1, load5, load15)%></strong></div>
+		<div class="kpc-item"><span>CPU 核心数</span><strong><%=cpu_count%> 核</strong></div>
+		<div class="kpc-item"><span>CPU 温度</span><strong><%=pcdata(cpu_temp)%></strong></div>
+		<div class="kpc-item"><span>设备温度</span><strong><%=pcdata(g.device_temp and (g.device_temp .. " °C") or "-")%></strong></div>
+		<div class="kpc-item"><span>WiFi 温度</span><strong><%=pcdata(g.wifi_temp and (g.wifi_temp .. " °C") or "-")%></strong></div>
+		<div class="kpc-item"><span>运行时间</span><strong><%=pcdata(fmt_dur(uptime))%></strong></div>
+	</div>
+</div>
+
+<!-- ====================== 网络 ====================== -->
+<fieldset class="cbi-section">
+	<h3>网络</h3>
+	<table class="kpc-table">
+		<tr><td style="width:180px">设备型号</td><td><%=pcdata(model_name)%></td></tr>
+		<tr><td>板型 / 系统</td><td><%=pcdata(trim(board.board_name) ~= "" and trim(board.board_name) or (board.system or "-"))%></td></tr>
+		<tr><td>固件版本</td><td><%=pcdata(trim(board.release and (board.release.description or "")) ~= "" and trim(board.release.description) or "-")%></td></tr>
+		<tr><td>内核版本</td><td><%=pcdata(trim(board.kernel) ~= "" and trim(board.kernel) or "-")%></td></tr>
+		<tr><td>WAN IPv4</td><td><%=pcdata(wan_ip ~= "" and wan_ip or "-")%></td></tr>
+		<tr><td>LAN IPv4</td><td><%=pcdata(lan_ip ~= "" and lan_ip or "-")%></td></tr>
+		<tr><td>系统 overlay</td><td><%=pcdata(disk("/overlay"))%></td></tr>
+		<tr><td>数据盘</td><td><%=pcdata(disk("/mnt/rootfs_2nd_data"))%></td></tr>
+		<tr><td>在线终端</td><td><%=#terminals%> 台</td></tr>
+	</table>
+</fieldset>
+
+<!-- ====================== 蜂窝线路 ====================== -->
+<fieldset class="cbi-section">
+	<h3>蜂窝线路</h3>
+	<% if #cellular == 0 then %>
+	<p class="kpc-hint">当前未检测到已激活的蜂窝线路。</p>
+	<% else %>
+	<div class="kpc-grid">
+		<% for _, c in ipairs(cellular) do %>
+		<div class="kpc-item">
+			<span><%=pcdata(c.name)%> · <%=pcdata(c.isp ~= "" and c.isp or "未知运营商")%></span>
+			<strong><%=pcdata(c.mode ~= "" and c.mode or "-")%></strong>
+			<div class="kpc-sig-wrap" style="margin-top:6px">
+				<span class="kpc-nowarn"><%=pcdata(c.rsrp ~= "" and (c.rsrp .. " dBm") or "-")%></span>
+				<div class="kpc-sig-bar <%=sig_class(c.rsrp)%>"><i style="width:<%=sig_pct(c.rsrp)%>%"></i></div>
+			</div>
+			<span class="kpc-nowarn" style="margin-top:4px">
+				Band <%=pcdata(c.band ~= "" and c.band or "-")%> · SINR <%=pcdata(c.sinr ~= "" and c.sinr or "-")%> dB · <%=pcdata(c.temp ~= "" and (c.temp .. " °C") or "-")%>
+			</span>
+		</div>
+		<% end %>
+	</div>
+	<% end %>
+</fieldset>
+
+<!-- ====================== 网口 ====================== -->
+<fieldset class="cbi-section">
+	<h3>网口状态</h3>
+	<table class="kpc-table">
+		<tr><th>端口</th><th>链路</th><th>协商模式</th><th>速率</th></tr>
+		<%
+			local port_keys = {}
+			for k in pairs(ports) do port_keys[#port_keys + 1] = k end
+			table.sort(port_keys)
+		%>
+		<% if #port_keys == 0 then %>
+		<tr><td colspan="4" class="kpc-hint">无法读取网口状态。</td></tr>
+		<% else %>
+		<% for _, k in ipairs(port_keys) do local p = ports[k] %>
+		<tr>
+			<td><%=pcdata(k)%></td>
+			<td><span class="kpc-pill <%= (trim(p.status) == "up") and "kpc-on" or "kpc-off" %>"><%=pcdata(trim(p.status) ~= "" and trim(p.status) or "n/a")%></span></td>
+			<td><%=pcdata(trim(p.mode) ~= "" and trim(p.mode) or "n/a")%></td>
+			<td><%=pcdata(trim(p.speed) ~= "" and trim(p.speed) or "n/a")%></td>
+		</tr>
+		<% end %>
+		<% end %>
+	</table>
+</fieldset>
+
+<!-- ====================== 终端列表 ====================== -->
+<fieldset class="cbi-section">
+	<h3>终端列表</h3>
+	<% if #terminals == 0 then %>
+	<p class="kpc-hint">当前无在线终端。</p>
+	<% else %>
+	<table class="kpc-table">
+		<tr><th>#</th><th>类型</th><th>主机名</th><th>MAC</th><th>IP</th><th>信号</th><th>累计收发</th></tr>
+		<% for i, t in ipairs(terminals) do %>
+		<tr>
+			<td><%=i%></td>
+			<td><%=pcdata(t.typ ~= "" and t.typ or "-")%></td>
+			<td><%=pcdata(t.host ~= "" and t.host or "-")%></td>
+			<td><%=pcdata(t.mac)%></td>
+			<td><%=pcdata(t.ip ~= "" and t.ip or "-")%></td>
+			<td>
+				<% if t.rssi ~= "" then %>
+				<div class="kpc-sig-wrap" style="min-width:110px">
+					<span class="kpc-nowarn"><%=pcdata(t.rssi)%></span>
+					<div class="kpc-sig-bar <%=sig_class(t.rssi)%>"><i style="width:<%=sig_pct(t.rssi)%>%"></i></div>
+				</div>
+				<% else %>-<% end %>
+			</td>
+			<td><%=pcdata(fmt(t.tx))%> / <%=pcdata(fmt(t.rx))%></td>
+		</tr>
+		<% end %>
+	</table>
+	<% end %>
+</fieldset>
+
+<%+footer%>
